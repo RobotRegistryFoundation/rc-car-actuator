@@ -36,6 +36,7 @@ from pathlib import Path
 from robot_md_gateway.actuator import ActuatorOutcome
 
 from rc_car_actuator.deadman import DEFAULT_TIMEOUT_S, Deadman
+from rc_car_actuator.envelope import DriveEnvelope, EnvelopeError
 from rc_car_actuator.drive import (
     DEFAULT_MAX_THROTTLE,
     DriveHardware,
@@ -58,6 +59,7 @@ MAX_LEASE_S = 2.0
 #: ROBOT.md capability names this driver actually implements.
 IMPLEMENTED_CAPABILITIES: frozenset[str] = frozenset({
     "drive.set", "drive.stop", "status.report",
+    "drive.envelope.open", "drive.envelope.revoke",
 })
 
 #: Minimum caller tiers per tool, enforced here as defence in depth. The
@@ -72,6 +74,12 @@ REQUIRED_TIERS: dict[str, frozenset[str]] = {
     "drive.set": frozenset({"actuate", "commission"}),
     "drive.stop": frozenset({"read", "actuate", "commission"}),
     "status.report": frozenset({"read", "actuate", "commission"}),
+    # Opening an envelope is the approval itself — it is what grants a budget of
+    # physical motion — so it demands the same tier as moving.
+    "drive.envelope.open": frozenset({"actuate", "commission"}),
+    # Revoking is like stopping: never refuse it. Someone who can see the car
+    # can withdraw its permission to move.
+    "drive.envelope.revoke": frozenset({"read", "actuate", "commission"}),
 }
 
 
@@ -82,7 +90,8 @@ class RCCarActuator:
     description = "Wire-controlled RC car drive actuator with a heartbeat deadman."
     config_schema: dict = {}
 
-    capabilities = ("drive.set", "drive.stop", "status.report")
+    capabilities = ("drive.set", "drive.stop", "status.report",
+                    "drive.envelope.open", "drive.envelope.revoke")
 
     def __init__(
         self,
@@ -103,6 +112,9 @@ class RCCarActuator:
         self._last_command: tuple[float, float] = (0.0, 0.0)
         self._commands = 0
         self._estopped = False
+        #: The current approval. None means the car has no authority to move at
+        #: all — the default, and the state it returns to when a budget runs out.
+        self._envelope: DriveEnvelope | None = None
 
         # The deadman owns stopping. It starts EXPIRED, so the car cannot move
         # until a command actually arrives.
@@ -127,6 +139,16 @@ class RCCarActuator:
             self._hw.neutral()
         finally:
             self._last_command = (0.0, 0.0)
+            # Close the billing segment here too, not only on an explicit stop:
+            # the common case is a lease expiring on the deadman's own thread
+            # with nobody calling anything. Charging only on explicit stops
+            # would make every abandoned command free, and abandonment is
+            # exactly what the deadman exists to handle.
+            #
+            # Pure arithmetic under a short lock — no I/O — so this cannot wedge
+            # the stop path the way the hardware lock once did.
+            if self._envelope is not None:
+                self._envelope.end_motion()
 
     # -- capabilities ------------------------------------------------------
 
@@ -150,7 +172,30 @@ class RCCarActuator:
             return {"throttle": 0.0, "steering": 0.0, "lease_s": 0.0,
                     "note": "zero duration treated as stop"}
 
+        envelope = self._envelope
+        if envelope is None:
+            raise EnvelopeError(
+                "no drive approval is open — approve a drive budget before moving")
+        unusable = envelope.reason_unusable()
+        if unusable is not None:
+            # Stop as well as refuse. The car may still be rolling on a lease
+            # granted moments ago, and a refusal that leaves it moving is not a
+            # refusal of motion.
+            self.drive_stop()
+            raise EnvelopeError(unusable)
+
+        # A lease may never outlive the budget that pays for it. Without this a
+        # 2 s lease granted with 0.5 s of budget remaining would drive for the
+        # full 2 s — the budget would be checked at command time and then
+        # ignored while the car was actually moving, which is the only time it
+        # matters. Capping here means the deadman, which already stops the car
+        # when a lease ends, also stops it when the budget runs out. One
+        # mechanism, not two racing ones.
+        lease = min(lease, envelope.remaining_s)
+
+        # The envelope's ceiling composes with the driver's own; the lower wins.
         applied_throttle = clamp(throttle, self._max_throttle)
+        applied_throttle = envelope.cap_throttle(applied_throttle)
         applied_steering = clamp(steering)
 
         with _DRIVE_LOCK:
@@ -158,20 +203,37 @@ class RCCarActuator:
             self._last_command = (applied_throttle, applied_steering)
             self._commands += 1
 
+        # Billing starts only once the wheels are actually commanded to turn,
+        # and only for real motion — a steering-only command with zero throttle
+        # moves the car nowhere and costs nothing.
+        if applied_throttle != 0.0:
+            envelope.begin_motion()
+        else:
+            envelope.end_motion()
+
         # Fed AFTER the write succeeds. Feeding first would keep the car alive
         # on the strength of a command that then failed to reach the hardware.
         self._deadman.feed()
 
-        # Re-check, because the check at the top of this method raced: an e-stop
-        # arriving while the throttle was being written would otherwise have its
-        # neutral overwritten by this command, and the feed above would re-arm
-        # the lease — a car driving away from a pressed emergency stop.
+        # Re-check EVERYTHING that can withdraw permission, because the checks at
+        # the top of this method raced. An e-stop or a revocation arriving while
+        # the throttle was being written would otherwise have its neutral
+        # overwritten by this command, and the feed above would re-arm the lease
+        # — a car driving away from a pressed emergency stop, or driving on
+        # authority that was explicitly taken away.
         #
-        # Checking again after the fact closes that window from this side, so
-        # e-stop needs no lock and can never deadlock against a hardware write.
+        # Checking again after the fact closes that window from this side, which
+        # is why neither e-stop nor revoke needs a lock and why neither can
+        # deadlock against a hardware write.
         if self._estopped:
             self.drive_stop()
             raise RuntimeError("e-stop engaged while the command was being applied")
+        withdrawn = envelope.reason_unusable()
+        if withdrawn is not None or self._envelope is not envelope:
+            self.drive_stop()
+            raise EnvelopeError(
+                withdrawn or "the drive approval was replaced while the command was "
+                             "being applied")
 
         return {
             "throttle": applied_throttle,
@@ -183,6 +245,12 @@ class RCCarActuator:
             # has returned, and the car is still moving.
             "blocking": False,
             "stops_at_monotonic": time.monotonic() + lease,
+            # Carried on every motion receipt so a signed record of the car
+            # moving traces back to the approval that permitted it. Without this
+            # the gateway's journal shows a thousand drive commands and no way to
+            # tell which human decision authorised them.
+            "envelope_id": envelope.id,
+            "motion_remaining_s": round(envelope.remaining_s, 3),
         }
 
     def drive_stop(self) -> dict:
@@ -209,6 +277,41 @@ class RCCarActuator:
         self._estopped = False
         return {"estopped": False, "note": "cleared; the car remains stopped until commanded"}
 
+    def envelope_open(self, motion_budget_s: float, window_s: float,
+                      max_throttle: float, approved_by: str = "") -> dict:
+        """Approve a bounded budget of motion.
+
+        Opening a new envelope REPLACES any current one rather than adding to
+        it, and closes out the old one's billing first. Accumulating budgets
+        would make "approve a little more" indistinguishable from "approve
+        without limit" after enough repetitions.
+        """
+        if self._estopped:
+            raise RuntimeError("e-stop is engaged; clear it before approving motion")
+        if self._envelope is not None:
+            self._envelope.end_motion()
+        # Any motion authorised by the previous envelope ends here, so the new
+        # budget starts from a stopped car rather than inheriting a live lease.
+        self.drive_stop()
+        self._envelope = DriveEnvelope(
+            motion_budget_s=motion_budget_s,
+            window_s=window_s,
+            max_throttle=max_throttle,
+            approved_by=approved_by,
+        )
+        return self._envelope.describe()
+
+    def envelope_revoke(self) -> dict:
+        """Withdraw the current approval and stop the car."""
+        if self._envelope is None:
+            return {"revoked": False, "note": "no drive approval was open"}
+        self._envelope.revoke()
+        # Revoking authority without stopping the vehicle would be theatre.
+        self.drive_stop()
+        described = self._envelope.describe()
+        self._envelope = None
+        return {"revoked": True, **described}
+
     def read_state(self) -> dict:
         throttle, steering = self._last_command
         return {
@@ -225,6 +328,10 @@ class RCCarActuator:
             # reading state rather than only anyone reading the source.
             "stop_layers": ["software deadman (this process)"],
             "firmware_lease": False,
+            "envelope": self._envelope.describe() if self._envelope else None,
+            "may_move": (self._envelope is not None
+                         and not self._envelope.expired
+                         and not self._estopped),
         }
 
     def shutdown(self) -> None:
@@ -266,6 +373,15 @@ class RCCarActuator:
                 )
             elif tool_name == "drive.stop":
                 telemetry = self.drive_stop()
+            elif tool_name == "drive.envelope.open":
+                telemetry = self.envelope_open(
+                    motion_budget_s=tool_args.get("motion_budget_s", 0.0),
+                    window_s=tool_args.get("window_s", 0.0),
+                    max_throttle=tool_args.get("max_throttle", self._max_throttle),
+                    approved_by=tool_args.get("approved_by", ""),
+                )
+            elif tool_name == "drive.envelope.revoke":
+                telemetry = self.envelope_revoke()
             elif tool_name == "status.report":
                 telemetry = self.read_state()
             else:

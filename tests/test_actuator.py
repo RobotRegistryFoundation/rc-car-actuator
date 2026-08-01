@@ -25,6 +25,23 @@ MANIFEST = Path("/tmp/does-not-matter.md")
 
 @pytest.fixture
 def car():
+    """A car with a generous approval already open.
+
+    Most tests here are about the lease and the hardware, not about
+    authorisation, so they start from an approved state. The tests that care
+    about approval build their own actuator — see the envelope section.
+    """
+    hw = SimulatedDrive()
+    actuator = RCCarActuator(hardware=hw, lease_timeout_s=0.3)
+    actuator.envelope_open(motion_budget_s=60.0, window_s=300.0,
+                           max_throttle=1.0, approved_by="test")
+    yield actuator, hw
+    actuator.shutdown()
+
+
+@pytest.fixture
+def unapproved_car():
+    """A car with no approval — the default state of a freshly built driver."""
     hw = SimulatedDrive()
     actuator = RCCarActuator(hardware=hw, lease_timeout_s=0.3)
     yield actuator, hw
@@ -144,6 +161,7 @@ def test_default_hardware_cannot_move_a_real_vehicle():
 
 def test_throttle_is_capped_and_the_cap_is_reported(car):
     actuator, hw = car
+    actuator.envelope_open(motion_budget_s=60.0, window_s=300.0, max_throttle=1.0)
     outcome = invoke(actuator, "drive.set",
                      {"throttle": 1.0, "steering": 0.0, "duration_s": 0.5})
     assert hw.last[0] == pytest.approx(0.35)
@@ -153,6 +171,7 @@ def test_throttle_is_capped_and_the_cap_is_reported(car):
 
 def test_reverse_is_capped_too(car):
     actuator, hw = car
+    actuator.envelope_open(motion_budget_s=60.0, window_s=300.0, max_throttle=1.0)
     invoke(actuator, "drive.set", {"throttle": -1.0, "steering": 0.0, "duration_s": 0.5})
     assert hw.last[0] == pytest.approx(-0.35)
 
@@ -326,6 +345,7 @@ def test_a_wedged_command_cannot_prevent_the_stop():
 
     hw = HangingDrive()
     actuator = RCCarActuator(hardware=hw, lease_timeout_s=0.2)
+    actuator.envelope_open(motion_budget_s=60.0, window_s=300.0, max_throttle=1.0)
     try:
         wedged = threading.Thread(
             target=lambda: actuator.drive_set(throttle=0.3, steering=0.0, duration_s=1.0),
