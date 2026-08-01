@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rc-car-actuator"
+version = "0.1.0"
+description = "Wire-controlled RC car drive actuator for robot-md-gateway, with a heartbeat deadman."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "RobotRegistryFoundation" },
+]
+dependencies = [
+    "robot-md-gateway>=0.5.0a1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-cov>=4.0"]
+# pigpio is only needed to drive real hardware; the simulated drive (and every
+# test) works without it.
+hardware = ["pigpio>=1.78"]
+
+[project.entry-points."robot_md_gateway.actuators"]
+rc-car = "rc_car_actuator.actuator:RCCarActuator"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rc_car_actuator"]
+
+[tool.pytest.ini_options]
+markers = ["hardware: requires a real wired RC car (none exists yet)"]
+addopts = "--strict-markers"
