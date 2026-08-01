@@ -22,6 +22,27 @@ Design constraints that follow from that, and why:
     value is neutral — not "whatever the PWM chip powered up holding".
   * `feed()` is the only thing that keeps the car alive, and it is called on the
     ACTUATION path only. Reading telemetry must never feed it.
+
+WHERE THIS IS NOT ENOUGH — read before trusting it:
+
+This is a Python thread on Linux. It covers the common failures (phone locks,
+app crashes, Wi-Fi drops, gateway hangs) because it does not share a thread with
+the request path. It does NOT cover the kernel stalling, the process being
+SIGKILLed, or the Pi browning out mid-drive — and a brownout is likely precisely
+when the motor draws current.
+
+So this is the SOFTWARE layer of a two-layer stop. The authoritative layer must
+be a lease that expires in firmware: an MCU between the Pi and the ESC that
+returns to neutral on its own timer unless the Pi keeps refreshing it. That one
+survives Linux dying entirely. Until it exists, this vehicle should only run
+with its wheels off the ground.
+
+A consequence for the actuator that uses this: `execute()` MUST NOT BLOCK. The
+arm's move() polls to convergence and returns when the joint arrives; a drive
+command that slept for its duration would hold the bus and delay the very stop
+that makes it safe. A drive duration is a LEASE, not a sleep — write the
+setpoint, extend the lease, return in about a millisecond. Motion ends because
+the lease expires, not because anyone waited for it.
 """
 from __future__ import annotations
 
