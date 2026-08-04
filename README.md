@@ -13,6 +13,30 @@ the call slept for the duration it would hold the request path for the whole
 motion, and the next request — the one saying "stop" — would queue behind the
 motion it was meant to cancel.
 
+## The lease a receipt reports is the lease the deadman enforces
+
+`drive.set` returns `lease_s` and `stops_at_monotonic`, the gateway signs them,
+and someone will later rely on them. So they are read back from the watchdog
+*after* it grants the lease rather than computed beside it, and every bound is
+applied in the watchdog itself:
+
+| bound | value | applies when |
+|---|---|---|
+| per-command ceiling | `MAX_LEASE_S` = 2.0 s | any single command, however long it asks for |
+| no-duration default | `DEFAULT_TIMEOUT_S` = 0.4 s | a command that states no duration |
+| remaining motion budget | the envelope's | whenever it is the tighter bound |
+
+`lease_cut_by` names which one did the cutting, and `stop_detect_within_s`
+(one watchdog tick, 50 ms) is the honest error bar: expiry is detected by
+polling, so the wheels go neutral in `[stops_at_monotonic, + one tick]` — never
+before the promised instant. `drive.stop`, `drive.envelope.revoke` and the
+e-stop outrank any live lease and take effect at once.
+
+This is written down because it was once false. The driver reported `lease_s:
+2.0` while a fixed 0.4 s timeout stopped the car — safe by accident, and a
+signed untruth about when a vehicle stops. Every test asserted the reported
+number and none timed the vehicle, which is exactly how it shipped.
+
 ## Safety status: NOT ROAD READY
 
 The deadman is a Python thread on Linux. It covers a locked phone, a crashed
@@ -66,7 +90,7 @@ moving traces back to the human decision that permitted it.
 | `drive.envelope.revoke` | **read** | Withdraw approval and stop the car. |
 | `drive.set` | actuate | Set throttle/steering, draw on the budget, extend the lease. Returns immediately. Refused with no open envelope. |
 | `drive.stop` | **read** | Stop now. |
-| `status.report` | read | Throttle, steering, lease remaining, budget remaining, e-stop state. |
+| `status.report` | read | Throttle, steering, lease in force and remaining, budget remaining, e-stop state. |
 
 `drive.stop` and `drive.envelope.revoke` require only the `read` tier: a stop
 that can be refused is not a stop, and there is no failure mode where refusing

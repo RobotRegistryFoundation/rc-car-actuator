@@ -18,6 +18,16 @@ next request — the one saying "stop" — would queue behind it. The stop would
 arrive after the motion it was meant to cancel. Motion ends because the lease
 expires on the deadman's own thread, not because anyone waited for it.
 
+AND THE RECEIPT MUST SAY WHEN THAT IS. Every field this file returns is signed by
+the gateway and kept as evidence, so `lease_s` and `stops_at_monotonic` are not
+descriptions of intent — they are claims about a physical vehicle that someone
+will later rely on. They are therefore read back from the deadman AFTER it has
+granted the lease, never computed alongside it. This driver once reported a 2.0 s
+lease while a fixed 0.4 s timeout stopped the car: safe by luck, and a signed
+untruth about when the wheels stop. The number in the receipt is now the number
+the watchdog thread enforces, clamped by the same two bounds — the per-command
+ceiling and the envelope's remaining motion budget — that actually apply.
+
 WHAT THIS DOES NOT PROTECT AGAINST, stated plainly: the deadman is a Python
 thread on Linux. It covers a locked phone, a crashed app, dropped Wi-Fi, a hung
 gateway. It does NOT cover the kernel stalling, this process being SIGKILLed, or
@@ -30,12 +40,11 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
 from pathlib import Path
 
 from robot_md_gateway.actuator import ActuatorOutcome
 
-from rc_car_actuator.deadman import DEFAULT_TIMEOUT_S, Deadman
+from rc_car_actuator.deadman import DEFAULT_TIMEOUT_S, MAX_LEASE_S, Deadman
 from rc_car_actuator.envelope import DriveEnvelope, EnvelopeError
 from rc_car_actuator.drive import (
     DEFAULT_MAX_THROTTLE,
@@ -51,10 +60,15 @@ logger = logging.getLogger("rc_car.actuator")
 #: would leave the ESC holding whichever value happened to land last.
 _DRIVE_LOCK = threading.Lock()
 
-#: The longest a single command may keep the car alive without being renewed.
-#: A lease is not a schedule: asking for 30 seconds of throttle and walking away
-#: is precisely the thing this design exists to prevent.
-MAX_LEASE_S = 2.0
+# MAX_LEASE_S — the longest a single command may keep the car alive without
+# being renewed — is re-exported from `deadman`, where it now lives. A lease is
+# not a schedule: asking for 30 seconds of throttle and walking away is
+# precisely the thing this design exists to prevent, and a bound stated here
+# while the watchdog enforced a different one is precisely how this driver came
+# to sign receipts it did not honour. One ceiling, in one place, inside the
+# thread that applies it.
+__all__ = ["MAX_LEASE_S", "RCCarActuator", "IMPLEMENTED_CAPABILITIES",
+           "REQUIRED_TIERS"]
 
 #: ROBOT.md capability names this driver actually implements.
 IMPLEMENTED_CAPABILITIES: frozenset[str] = frozenset({
@@ -98,6 +112,7 @@ class RCCarActuator:
         hardware: DriveHardware | None = None,
         max_throttle: float = DEFAULT_MAX_THROTTLE,
         lease_timeout_s: float = DEFAULT_TIMEOUT_S,
+        max_lease_s: float = MAX_LEASE_S,
     ) -> None:
         """
         Args:
@@ -106,6 +121,11 @@ class RCCarActuator:
                 able to move a real vehicle by accident.
             max_throttle: Ceiling applied to every commanded throttle, on top of
                 whatever the caller asked for.
+            lease_timeout_s: Lease given to a command that states no duration.
+            max_lease_s: Longest lease any single command may buy. An operator
+                may TIGHTEN this — a tow-test wants half a second, not two — but
+                the deadman clamps it to `MAX_LEASE_S` regardless, so nothing
+                here can widen the bound.
         """
         self._hw: DriveHardware = hardware if hardware is not None else SimulatedDrive()
         self._max_throttle = abs(clamp(max_throttle))
@@ -118,7 +138,8 @@ class RCCarActuator:
 
         # The deadman owns stopping. It starts EXPIRED, so the car cannot move
         # until a command actually arrives.
-        self._deadman = Deadman(stop=self._stop_hardware, timeout_s=lease_timeout_s)
+        self._deadman = Deadman(stop=self._stop_hardware, timeout_s=lease_timeout_s,
+                                max_lease_s=max_lease_s)
 
     # -- hardware ----------------------------------------------------------
 
@@ -152,19 +173,32 @@ class RCCarActuator:
 
     # -- capabilities ------------------------------------------------------
 
-    def drive_set(self, throttle: float, steering: float, duration_s: float) -> dict:
+    def drive_set(self, throttle: float, steering: float,
+                  duration_s: float | None = None) -> dict:
         """Set the drive setpoint and extend the lease. DOES NOT BLOCK.
 
         Returns as soon as the setpoint is written — typically about a
         millisecond. The car keeps moving because the lease is alive, and stops
         when it expires. Nothing here sleeps for `duration_s`; see the module
         docstring for why that distinction is the whole design.
+
+        `duration_s=None` means "no opinion" and takes the deadman's short
+        default. That is NOT the same as the RCAN contract's `duration_s: 0`,
+        which is an explicit request for a zero-length lease — i.e. a stop.
         """
         if self._estopped:
             raise RuntimeError(
                 "e-stop is engaged; clear it before commanding motion")
 
-        lease = max(0.0, min(MAX_LEASE_S, float(duration_s)))
+        # The ceiling is applied by the deadman, which is what actually enforces
+        # it. Asking it rather than re-deriving the bound here is the difference
+        # between a receipt that describes the mechanism and a receipt that
+        # describes a second, hopeful copy of the mechanism.
+        requested_lease = None if duration_s is None else float(duration_s)
+        lease = self._deadman.clamp_lease(duration_s)
+        lease_cut_by = None
+        if requested_lease is not None and lease < requested_lease:
+            lease_cut_by = "ceiling"
         if lease <= 0:
             # A zero-length lease is a stop, not a no-op. Treating it as "ignore"
             # would leave the previous throttle running.
@@ -191,7 +225,12 @@ class RCCarActuator:
         # matters. Capping here means the deadman, which already stops the car
         # when a lease ends, also stops it when the budget runs out. One
         # mechanism, not two racing ones.
-        lease = min(lease, envelope.remaining_s)
+        if envelope.remaining_s < lease:
+            lease = envelope.remaining_s
+            # The budget is the tighter bound, and says so: "you asked for 2 s
+            # and got 0.3 s" is only actionable if the receipt names which limit
+            # did the cutting.
+            lease_cut_by = "budget"
 
         # The envelope's ceiling composes with the driver's own; the lower wins.
         applied_throttle = clamp(throttle, self._max_throttle)
@@ -213,7 +252,22 @@ class RCCarActuator:
 
         # Fed AFTER the write succeeds. Feeding first would keep the car alive
         # on the strength of a command that then failed to reach the hardware.
-        self._deadman.feed()
+        #
+        # `granted` is what the deadman will actually enforce, and it — not
+        # `duration_s`, and not `lease` — is what the receipt below reports. The
+        # two used to differ by 5x: receipts said 2.0 s while a fixed 0.4 s
+        # timeout stopped the car. It erred safe and it was still a lie, and a
+        # signed lie about when a vehicle stops is worse than no signature.
+        granted = self._deadman.feed(for_s=lease)
+        stops_at = self._deadman.expires_at_monotonic
+        if stops_at is None:
+            # A stop, an e-stop or a revoke landed on another thread between the
+            # feed and this read. The car is neutral, so the receipt says the
+            # lease is gone rather than quoting one that no longer exists. (The
+            # re-checks below usually turn this into an outright refusal; this
+            # keeps the telemetry honest even when they do not.)
+            granted = 0.0
+            lease_cut_by = "stopped"
 
         # Re-check EVERYTHING that can withdraw permission, because the checks at
         # the top of this method raced. An e-stop or a revocation arriving while
@@ -240,11 +294,22 @@ class RCCarActuator:
             "steering": applied_steering,
             "requested_throttle": float(throttle),
             "throttle_capped": abs(clamp(throttle)) > self._max_throttle,
-            "lease_s": lease,
+            # The lease GRANTED, read back from the deadman that will enforce
+            # it — never the lease requested.
+            "lease_s": granted,
+            "requested_lease_s": requested_lease,
+            # Which bound cut the request, in the approver's terms, so a short
+            # lease is legible instead of merely surprising.
+            "lease_cut_by": lease_cut_by,
             # Said explicitly because it is the counterintuitive part: the call
             # has returned, and the car is still moving.
             "blocking": False,
-            "stops_at_monotonic": time.monotonic() + lease,
+            "stops_at_monotonic": stops_at,
+            # Expiry is detected on a polling tick, so the wheels go neutral in
+            # [stops_at, stops_at + this]. Stated rather than implied: promising
+            # a stop instant to the microsecond would be a second untruth on the
+            # same receipt.
+            "stop_detect_within_s": self._deadman.tick_s,
             # Carried on every motion receipt so a signed record of the car
             # moving traces back to the approval that permitted it. Without this
             # the gateway's journal shows a thousand drive commands and no way to
@@ -319,7 +384,11 @@ class RCCarActuator:
             "steering": steering,
             "moving": self._deadman.alive and throttle != 0.0,
             "lease_alive": self._deadman.alive,
+            # The lease in force RIGHT NOW, so a reader can check a receipt's
+            # claim against the mechanism without waiting for it to expire.
+            "lease_s": round(self._deadman.lease_s, 3),
             "lease_seconds_remaining": round(self._deadman.seconds_remaining, 3),
+            "lease_max_s": self._deadman.max_lease_s,
             "estopped": self._estopped,
             "max_throttle": self._max_throttle,
             "commands_accepted": self._commands,

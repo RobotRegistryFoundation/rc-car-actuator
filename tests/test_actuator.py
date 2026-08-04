@@ -81,13 +81,21 @@ def test_execute_returns_immediately_and_does_not_sleep_for_the_duration(car):
 
 
 def test_car_stops_on_its_own_when_the_lease_expires(car):
-    """Nobody sent a stop. The car must stop anyway."""
+    """Nobody sent a stop. The car must stop anyway.
+
+    The sleep is derived from the lease the RECEIPT reported, not from a number
+    written into the test. Both used to be here, they disagreed by 5x, and the
+    test passed on the shorter one — which is precisely how a driver ships that
+    signs receipts it does not honour.
+    """
     actuator, hw = car
-    invoke(actuator, "drive.set", {"throttle": 0.3, "steering": 0.0, "duration_s": 1.0})
+    outcome = invoke(actuator, "drive.set",
+                     {"throttle": 0.3, "steering": 0.0, "duration_s": 0.4})
     assert hw.last[0] > 0
+    lease = outcome.telemetry["lease_s"]
 
     # Deliberately send nothing — this is the phone-locked / Wi-Fi-dropped case.
-    time.sleep(0.3 + 0.25)
+    time.sleep(lease + 0.25)
     assert hw.last == (0.0, 0.0), "the deadman did not return the car to neutral"
     assert actuator.read_state()["moving"] is False
 
@@ -95,8 +103,9 @@ def test_car_stops_on_its_own_when_the_lease_expires(car):
 def test_neutral_is_re_asserted_repeatedly_while_expired(car):
     """One stop write is not a safety story — a single write can be lost."""
     actuator, hw = car
-    invoke(actuator, "drive.set", {"throttle": 0.3, "steering": 0.0, "duration_s": 1.0})
-    time.sleep(0.3 + 0.2)
+    outcome = invoke(actuator, "drive.set",
+                     {"throttle": 0.3, "steering": 0.0, "duration_s": 0.4})
+    time.sleep(outcome.telemetry["lease_s"] + 0.2)
     first = hw.neutral_count
     time.sleep(0.25)
     assert hw.neutral_count > first, "neutral was written once and then abandoned"
@@ -128,6 +137,138 @@ def test_zero_duration_is_a_stop_not_a_no_op(car):
     assert hw.last[0] > 0
     invoke(actuator, "drive.set", {"throttle": 0.3, "steering": 0.0, "duration_s": 0.0})
     assert hw.last == (0.0, 0.0)
+
+
+# --------------------------------------------------------------------------- #
+# The receipt must be true about when the wheels stop
+#
+# Everything above asserts the number the driver REPORTS. That is exactly how a
+# 5x-wrong lease shipped: `lease_s: 2.0` on a signed receipt while a fixed
+# 0.4 s timeout stopped the car. These tests time the vehicle instead.
+# --------------------------------------------------------------------------- #
+
+def seconds_until_stopped(actuator, limit_s: float = 6.0) -> float:
+    """Seconds until telemetry says the lease is dead. Polls the mechanism."""
+    start = time.monotonic()
+    while actuator.read_state()["lease_alive"]:
+        if time.monotonic() - start > limit_s:
+            return float("inf")
+        time.sleep(0.005)
+    return time.monotonic() - start
+
+
+def test_the_reported_lease_is_the_lease_actually_enforced(car):
+    """THE defect. A receipt that says 0.6 s must buy 0.6 s of motion.
+
+    Signed evidence is only worth the mechanism behind it. A receipt asserting a
+    stop time the deadman will not honour is worse than an unsigned one, because
+    it invites someone to rely on it.
+    """
+    actuator, hw = car
+    outcome = invoke(actuator, "drive.set",
+                     {"throttle": 0.3, "steering": 0.0, "duration_s": 0.6})
+    reported = outcome.telemetry["lease_s"]
+    assert reported == pytest.approx(0.6)
+    assert hw.last[0] > 0
+
+    measured = seconds_until_stopped(actuator)
+    assert measured == pytest.approx(reported, abs=0.15), (
+        f"the receipt promised {reported}s of motion and the car stopped after "
+        f"{measured:.3f}s")
+    assert hw.last == (0.0, 0.0)
+
+
+def test_the_receipt_stop_instant_matches_the_deadman(car):
+    """`stops_at_monotonic` is read back from the watchdog, not recomputed."""
+    actuator, hw = car
+    outcome = invoke(actuator, "drive.set",
+                     {"throttle": 0.3, "steering": 0.0, "duration_s": 0.5})
+    promised = outcome.telemetry["stops_at_monotonic"]
+
+    seconds_until_stopped(actuator)
+    overshoot = time.monotonic() - promised
+    assert overshoot >= 0.0, "the car stopped BEFORE the receipt said it would"
+    assert overshoot <= outcome.telemetry["stop_detect_within_s"] + 0.1, (
+        f"the car stopped {overshoot:.3f}s after the instant the receipt named")
+
+
+def test_a_capped_lease_reports_and_enforces_the_cap():
+    """Asking for a minute reports the ceiling — and stops at the ceiling."""
+    hw = SimulatedDrive()
+    # The ceiling may be tightened for a test the same way an operator would
+    # tighten it for a tow-test; what it may never do is widen.
+    actuator = RCCarActuator(hardware=hw, lease_timeout_s=0.2, max_lease_s=0.5)
+    actuator.envelope_open(motion_budget_s=60.0, window_s=300.0, max_throttle=1.0)
+    try:
+        outcome = invoke(actuator, "drive.set",
+                         {"throttle": 0.3, "steering": 0.0, "duration_s": 60.0})
+        assert outcome.telemetry["lease_s"] == pytest.approx(0.5)
+        assert outcome.telemetry["requested_lease_s"] == 60.0
+        assert outcome.telemetry["lease_cut_by"] == "ceiling"
+
+        measured = seconds_until_stopped(actuator)
+        assert measured == pytest.approx(0.5, abs=0.15), \
+            f"a lease clamped to 0.5s ran for {measured:.3f}s"
+        assert hw.last == (0.0, 0.0)
+    finally:
+        actuator.shutdown()
+
+
+def test_the_ceiling_cannot_be_widened_by_construction():
+    """An operator may tighten the per-command ceiling and never loosen it."""
+    hw = SimulatedDrive()
+    actuator = RCCarActuator(hardware=hw, max_lease_s=600.0)
+    try:
+        assert actuator.read_state()["lease_max_s"] == MAX_LEASE_S
+    finally:
+        actuator.shutdown()
+
+
+def test_a_command_with_no_duration_takes_the_short_default(car):
+    """No opinion about duration buys the conservative default, not the ceiling."""
+    actuator, _ = car
+    telemetry = actuator.drive_set(throttle=0.2, steering=0.0)
+    assert telemetry["lease_s"] == pytest.approx(0.3)   # the fixture's default
+    assert telemetry["requested_lease_s"] is None
+    measured = seconds_until_stopped(actuator)
+    assert measured == pytest.approx(0.3, abs=0.15)
+
+
+def test_stop_kills_a_long_live_lease_immediately(car):
+    """A stop must not have to wait out the lease it is cancelling."""
+    actuator, hw = car
+    outcome = invoke(actuator, "drive.set",
+                     {"throttle": 0.3, "steering": 0.0, "duration_s": MAX_LEASE_S})
+    assert outcome.telemetry["lease_s"] == pytest.approx(MAX_LEASE_S)
+    assert hw.last[0] > 0
+
+    start = time.monotonic()
+    invoke(actuator, "drive.stop", tier="read")
+    elapsed = time.monotonic() - start
+    assert hw.last == (0.0, 0.0), "a 2 s lease outlived a stop"
+    assert actuator.read_state()["lease_alive"] is False
+    assert elapsed < 0.1, f"the stop took {elapsed:.3f}s — it must be immediate"
+
+
+def test_revoke_kills_a_long_live_lease_immediately(car):
+    """Withdrawing the approval must stop the car, not wait for its lease."""
+    actuator, hw = car
+    invoke(actuator, "drive.set",
+           {"throttle": 0.3, "steering": 0.0, "duration_s": MAX_LEASE_S})
+    assert hw.last[0] > 0
+
+    invoke(actuator, "drive.envelope.revoke", tier="read")
+    assert hw.last == (0.0, 0.0), "a 2 s lease outlived a revocation"
+    assert actuator.read_state()["lease_alive"] is False
+
+
+def test_estop_kills_a_long_live_lease_immediately(car):
+    actuator, hw = car
+    invoke(actuator, "drive.set",
+           {"throttle": 0.3, "steering": 0.0, "duration_s": MAX_LEASE_S})
+    actuator.estop()
+    assert hw.last == (0.0, 0.0), "a 2 s lease outlived an e-stop"
+    assert actuator.read_state()["lease_alive"] is False
 
 
 # --------------------------------------------------------------------------- #

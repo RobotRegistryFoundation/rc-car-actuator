@@ -126,12 +126,54 @@ def test_running_out_stops_the_car_not_just_the_next_command(car):
 
 
 def test_lease_cannot_outlive_the_budget(car):
-    """A 2 s lease with 0.3 s of budget must be cut to 0.3 s."""
-    actuator, _ = car
+    """A 2 s lease with 0.3 s of budget must be cut to 0.3 s — and stop there.
+
+    The cut is reported AND enforced: the receipt names the budget as the bound
+    that did the cutting, and the car is timed to confirm it stopped when the
+    receipt said rather than when the request asked.
+    """
+    actuator, hw = car
     actuator.envelope_open(motion_budget_s=0.3, window_s=60, max_throttle=0.5)
     outcome = drive(actuator, duration=2.0)
-    assert outcome.telemetry["lease_s"] <= 0.31, \
-        f"lease {outcome.telemetry['lease_s']}s exceeded the 0.3s budget"
+    granted = outcome.telemetry["lease_s"]
+    assert granted <= 0.31, f"lease {granted}s exceeded the 0.3s budget"
+    assert outcome.telemetry["requested_lease_s"] == 2.0
+    assert outcome.telemetry["lease_cut_by"] == "budget"
+
+    start = time.monotonic()
+    while actuator.read_state()["lease_alive"] and time.monotonic() - start < 3.0:
+        time.sleep(0.005)
+    measured = time.monotonic() - start
+    assert measured == pytest.approx(granted, abs=0.15), (
+        f"the receipt promised {granted}s and the car drove for {measured:.3f}s "
+        f"on a 0.3s budget")
+    assert hw.last == (0.0, 0.0)
+
+
+def test_the_budget_is_charged_what_the_lease_actually_enforced(car):
+    """The seconds spent and the seconds granted must be the same seconds.
+
+    Charging is by ELAPSED motion and the lease is what bounds that elapsed
+    motion, so once the receipt is honest these two numbers describe the same
+    physical stretch of driving. When the receipt lied they differed by 5x: a
+    2 s lease on the receipt, 0.4 s of budget actually charged.
+    """
+    actuator, _ = car
+    actuator.envelope_open(motion_budget_s=10, window_s=60, max_throttle=0.5)
+    outcome = drive(actuator, duration=0.6)
+    granted = outcome.telemetry["lease_s"]
+
+    start = time.monotonic()
+    while actuator.read_state()["lease_alive"] and time.monotonic() - start < 3.0:
+        time.sleep(0.005)
+    time.sleep(0.05)   # let the stop path close the billing segment
+
+    spent = actuator.read_state()["envelope"]["motion_spent_s"]
+    assert spent == pytest.approx(granted, abs=0.15), (
+        f"the receipt granted {granted}s of motion and the budget was charged "
+        f"{spent}s")
+    assert spent >= granted - 0.02, \
+        "the budget was charged less than the motion actually granted"
 
 
 def test_exhausted_envelope_refuses_further_motion(car):
