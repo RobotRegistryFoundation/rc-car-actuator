@@ -390,6 +390,21 @@ class RCCarActuator:
                     outcome_kind="error",
                     error_message=f"unknown capability: {tool_name!r}",
                 )
+        except EnvelopeError as exc:
+            # Refusing to move without an approval is a DECISION, not a fault, and
+            # the two must not arrive at the caller looking alike. Reported as
+            # `denied` so the gateway signs it into a 403 receipt the operator can
+            # verify and keep — "the car would not move, and here is the signed
+            # reason" — rather than a 500 that reads as the robot falling over.
+            #
+            # Still stop first: the car may be rolling on a lease granted moments
+            # ago, and a refusal that leaves it moving is not a refusal of motion.
+            self.drive_stop()
+            return ActuatorOutcome(
+                success=False,
+                outcome_kind="denied",
+                error_message=str(exc),
+            )
         except Exception as exc:
             # A failure while commanding motion must not leave the car moving on
             # a lease that a partially-applied command already extended.
