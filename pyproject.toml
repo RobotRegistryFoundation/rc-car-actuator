@@ -18,9 +18,12 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "pytest-cov>=4.0"]
-# pigpio is only needed to drive real hardware; the simulated drive (and every
-# test) works without it.
+# Every hardware dependency is optional and imported lazily, so the simulated
+# drive — and the whole test suite, including the tests for the real backends —
+# runs with none of them installed.
 hardware = ["pigpio>=1.78"]
+pca9685 = ["smbus2>=0.4"]
+maestro = ["pyserial>=3.5"]
 
 [project.entry-points."robot_md_gateway.actuators"]
 rc-car = "rc_car_actuator.actuator:RCCarActuator"

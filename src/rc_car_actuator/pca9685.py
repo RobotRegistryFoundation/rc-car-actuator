@@ -36,7 +36,10 @@ import threading
 from dataclasses import dataclass
 from typing import Protocol
 
-from .drive import clamp
+from .drive import Channel, clamp
+
+__all__ = ["Channel", "DriveChannels", "PCA9685Drive", "I2CBus",
+           "NOMINAL_OSCILLATOR_HZ", "DEFAULT_FRAME_HZ", "open_smbus_drive"]
 
 logger = logging.getLogger("rc_car.pca9685")
 
@@ -70,37 +73,6 @@ class I2CBus(Protocol):
 
     def write_byte_data(self, addr: int, register: int, value: int) -> None: ...
     def read_byte_data(self, addr: int, register: int) -> int: ...
-
-
-@dataclass(frozen=True)
-class Channel:
-    """One PWM output, and the numbers that make it mean something.
-
-    A channel is not just a number, because two identical-looking servo headers
-    on the same board disagree about what "centre" is. The ESC's neutral is
-    whatever it was taught during its calibration; the steering servo's centre is
-    wherever the linkage happens to put the wheels straight. Both are per-vehicle
-    measurements, and hardcoding 1500 us for both is how a car creeps forward at
-    rest and tracks 5 degrees left.
-    """
-
-    index: int
-    #: Pulse width that means stop / straight ahead, microseconds.
-    neutral_us: float = 1500.0
-    #: Microseconds added at full command. The hobby standard is 500 (so
-    #: 1000-2000), but a steering linkage frequently binds before full travel,
-    #: and a servo pushing against a bind stalls, heats, and dies.
-    span_us: float = 500.0
-    #: Flip the direction of this channel. Which way "forward" is depends on how
-    #: the ESC is wired and which way round the servo horn went on.
-    invert: bool = False
-
-    def pulse_us(self, value: float) -> float:
-        """Pulse width for a command in -1..1, clamped and NaN-safe."""
-        v = clamp(value)
-        if self.invert:
-            v = -v
-        return self.neutral_us + v * self.span_us
 
 
 @dataclass(frozen=True)

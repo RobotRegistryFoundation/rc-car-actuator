@@ -94,28 +94,78 @@ def drive_from_env(environ: dict[str, str] | None = None) -> DriveHardware:
     if name == "pca9685":
         return _pca9685_from_env(env)
 
+    if name == "maestro":
+        return _maestro_from_env(env)
+
     if name == "pigpio":
         return _pigpio_from_env(env)
 
     raise DriveConfigError(
         f"{ENV_BACKEND}={name!r} is not a known drive backend "
-        f"(simulated, pca9685, pigpio)")
+        f"(simulated, pca9685, maestro, pigpio)")
+
+
+def _channel_from_env(env, prefix: str, index_default: int):  # noqa: ANN001, ANN201
+    """The per-vehicle trim for one channel, shared by both PWM backends.
+
+    Identical for a PCA9685 and a Maestro because the measurements are about the
+    VEHICLE — where the ESC sits still, where the linkage points the wheels
+    straight, how far it can travel before it binds — and not about the chip.
+    """
+    from .drive import Channel
+
+    return Channel(
+        index=_int(env, f"OPENCASTOR_DRIVE_{prefix}_CHANNEL", index_default),
+        neutral_us=_float(env, f"OPENCASTOR_DRIVE_{prefix}_NEUTRAL_US", 1500.0),
+        span_us=_float(env, f"OPENCASTOR_DRIVE_{prefix}_SPAN_US", 500.0),
+        invert=_bool(env, f"OPENCASTOR_DRIVE_{prefix}_INVERT"),
+    )
+
+
+def _maestro_from_env(env) -> DriveHardware:  # noqa: ANN001
+    from .maestro import MaestroChannels, MaestroDrive
+
+    device = env.get("OPENCASTOR_DRIVE_MAESTRO_DEVICE")
+    channels = MaestroChannels(
+        throttle=_channel_from_env(env, "THROTTLE", 0),
+        steering=_channel_from_env(env, "STEERING", 1),
+        device_number=_int(env, "OPENCASTOR_DRIVE_MAESTRO_DEVICE", 0) if device else None,
+        steering_speed=_int(env, "OPENCASTOR_DRIVE_STEERING_SPEED", 0),
+    )
+    port_name = env.get("OPENCASTOR_DRIVE_SERIAL_PORT") or "/dev/ttyACM0"
+
+    try:
+        import serial
+    except ImportError as exc:
+        raise DriveConfigError(
+            "OPENCASTOR_DRIVE=maestro needs pyserial (pip install "
+            "'rc-car-actuator[maestro]'). Refusing to fall back to simulation."
+        ) from exc
+
+    try:
+        port = serial.Serial(port_name, 115200, timeout=0.2)
+    except Exception as exc:  # serial.SerialException and friends
+        raise DriveConfigError(
+            f"cannot open {port_name} ({exc}). The Maestro presents TWO serial "
+            f"devices and only the LOWER-numbered one is the command port; "
+            f"check `ls /dev/ttyACM*` and that the user is in the dialout group."
+        ) from exc
+
+    logger.warning(
+        "REAL DRIVE HARDWARE: Pololu Maestro on %s, throttle ch%d, steering ch%d. "
+        "The serial-timeout failsafe is a DEVICE setting this code cannot read — "
+        "verify it by unplugging on a stand, not by trusting this line. "
+        "Keep the wheels off the ground until the hardware stop is fitted.",
+        port_name, channels.throttle.index, channels.steering.index)
+    return MaestroDrive(port, channels=channels)
 
 
 def _pca9685_from_env(env) -> DriveHardware:  # noqa: ANN001
-    from .pca9685 import Channel, DriveChannels, PCA9685Drive
-
-    def channel(prefix: str, index_default: int) -> Channel:
-        return Channel(
-            index=_int(env, f"OPENCASTOR_DRIVE_{prefix}_CHANNEL", index_default),
-            neutral_us=_float(env, f"OPENCASTOR_DRIVE_{prefix}_NEUTRAL_US", 1500.0),
-            span_us=_float(env, f"OPENCASTOR_DRIVE_{prefix}_SPAN_US", 500.0),
-            invert=_bool(env, f"OPENCASTOR_DRIVE_{prefix}_INVERT"),
-        )
+    from .pca9685 import DriveChannels, PCA9685Drive
 
     channels = DriveChannels(
-        throttle=channel("THROTTLE", 0),
-        steering=channel("STEERING", 1),
+        throttle=_channel_from_env(env, "THROTTLE", 0),
+        steering=_channel_from_env(env, "STEERING", 1),
         frame_hz=_int(env, "OPENCASTOR_DRIVE_FRAME_HZ", 50),
         # See `DriveChannels.oscillator_hz`: the chip's 25 MHz is a cheap RC
         # oscillator, and every pulse it emits is scaled by the real figure.

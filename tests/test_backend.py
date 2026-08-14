@@ -54,6 +54,40 @@ def test_asking_for_real_hardware_that_is_unavailable_raises(monkeypatch):
     assert "smbus2" in str(exc.value)
 
 
+def test_asking_for_a_maestro_that_is_not_plugged_in_raises():
+    # Same rule as the PCA9685 path: a requested backend that cannot be built
+    # must not quietly become a simulator.
+    with pytest.raises(DriveConfigError) as exc:
+        drive_from_env({ENV_BACKEND: "maestro",
+                        "OPENCASTOR_DRIVE_SERIAL_PORT": "/dev/ttyACM-nope"})
+    message = str(exc.value)
+    assert "/dev/ttyACM-nope" in message
+    # The error names the failure mode that actually catches people out: the
+    # Maestro exposes two serial devices and only one of them takes commands.
+    assert "command port" in message
+
+
+def test_the_unknown_backend_message_lists_every_real_one():
+    with pytest.raises(DriveConfigError) as exc:
+        drive_from_env({ENV_BACKEND: "nope"})
+    for name in ("simulated", "pca9685", "maestro", "pigpio"):
+        assert name in str(exc.value)
+
+
+def test_both_pwm_backends_read_the_same_per_vehicle_trim():
+    # The trim describes the VEHICLE — where the ESC sits still, where the
+    # linkage points the wheels straight — so swapping controller must not mean
+    # re-measuring it under different variable names.
+    from rc_car_actuator.backend import _channel_from_env
+
+    env = {"OPENCASTOR_DRIVE_THROTTLE_NEUTRAL_US": "1480",
+           "OPENCASTOR_DRIVE_THROTTLE_INVERT": "yes"}
+    channel = _channel_from_env(env, "THROTTLE", 0)
+    assert channel.neutral_us == 1480
+    assert channel.invert is True
+    assert channel.pulse_us(1.0) == pytest.approx(980)
+
+
 def test_a_malformed_number_is_reported_against_its_own_variable():
     with pytest.raises(DriveConfigError) as exc:
         drive_from_env({ENV_BACKEND: "pca9685",

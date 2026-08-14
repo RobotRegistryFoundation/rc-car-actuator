@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from dataclasses import dataclass
 from typing import Protocol
 
 logger = logging.getLogger("rc_car.drive")
@@ -55,6 +56,42 @@ def clamp(value: float, limit: float = FULL_SCALE) -> float:
     if value != value:  # NaN
         return 0.0
     return max(-limit, min(limit, float(value)))
+
+
+@dataclass(frozen=True)
+class Channel:
+    """One PWM output, and the numbers that make it mean something.
+
+    Lives in this module rather than beside a particular driver because it is
+    the same three measurements whatever chip is emitting the pulse: a PCA9685
+    and a Pololu Maestro disagree about registers and protocols and agree
+    completely about what "neutral" means.
+
+    A channel is not just a number, because two identical-looking servo headers
+    on the same board disagree about what centre is. The ESC's neutral is
+    whatever it was taught during its calibration; the steering servo's centre
+    is wherever the linkage happens to put the wheels straight. Both are
+    per-vehicle measurements, and hardcoding 1500 us for both is how a car
+    creeps forward at rest and tracks 5 degrees left.
+    """
+
+    index: int
+    #: Pulse width that means stop / straight ahead, microseconds.
+    neutral_us: float = 1500.0
+    #: Microseconds added at full command. The hobby standard is 500 (so
+    #: 1000-2000), but a steering linkage frequently binds before full travel,
+    #: and a servo pushing against a bind stalls, heats, and dies.
+    span_us: float = 500.0
+    #: Flip the direction of this channel. Which way "forward" is depends on how
+    #: the ESC is wired and which way round the servo horn went on.
+    invert: bool = False
+
+    def pulse_us(self, value: float) -> float:
+        """Pulse width for a command in -1..1, clamped and NaN-safe."""
+        v = clamp(value)
+        if self.invert:
+            v = -v
+        return self.neutral_us + v * self.span_us
 
 
 class SimulatedDrive:
