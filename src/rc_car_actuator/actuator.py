@@ -44,6 +44,7 @@ from pathlib import Path
 
 from robot_md_gateway.actuator import ActuatorOutcome
 
+from rc_car_actuator.backend import drive_from_env
 from rc_car_actuator.deadman import DEFAULT_TIMEOUT_S, MAX_LEASE_S, Deadman
 from rc_car_actuator.envelope import DriveEnvelope, EnvelopeError
 from rc_car_actuator.drive import (
@@ -127,7 +128,15 @@ class RCCarActuator:
                 the deadman clamps it to `MAX_LEASE_S` regardless, so nothing
                 here can widen the bound.
         """
-        self._hw: DriveHardware = hardware if hardware is not None else SimulatedDrive()
+        # An explicit `hardware=` always wins — that is the seam every test uses.
+        # With nothing passed, the environment decides, and with nothing in the
+        # environment either it is `SimulatedDrive`. The environment step exists
+        # because the gateway constructs actuators from an entry point with NO
+        # arguments, so without it a car wired to real hardware would be driven
+        # by the simulator forever, reporting perfect receipts and never moving.
+        # See `backend.drive_from_env` for why a requested backend that cannot be
+        # built raises instead of quietly falling back.
+        self._hw: DriveHardware = hardware if hardware is not None else drive_from_env()
         self._max_throttle = abs(clamp(max_throttle))
         self._last_command: tuple[float, float] = (0.0, 0.0)
         self._commands = 0
