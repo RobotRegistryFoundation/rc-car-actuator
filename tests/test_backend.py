@@ -278,3 +278,99 @@ class TestShutdownNeutral:
         # SIGTERM must still end the process. A handler that stops the wheels
         # and then hangs is its own outage.
         assert proc.returncode is not None
+
+
+class TestDriveRegistry:
+    """Drivers as registrations, not edits to dispatch logic."""
+
+    def test_the_builtins_are_registered(self):
+        from rc_car_actuator.backend import DRIVE_FACTORIES
+
+        for name in ("pca9685", "maestro", "pigpio", "pca9685-tank"):
+            assert name in DRIVE_FACTORIES
+
+    def test_an_unknown_backend_lists_what_actually_exists(self):
+        from rc_car_actuator.backend import DriveConfigError, drive_from_env
+
+        with pytest.raises(DriveConfigError) as err:
+            drive_from_env({"OPENCASTOR_DRIVE": "warp-drive"})
+        # The message enumerates the live registry rather than a hand-kept list
+        # that drifts as plugins land.
+        assert "pca9685-tank" in str(err.value)
+
+    def test_a_registered_plugin_name_becomes_a_valid_backend(self):
+        from rc_car_actuator.backend import DRIVE_FACTORIES, drive_from_env, register_drive
+        from rc_car_actuator.drive import SimulatedDrive
+
+        @register_drive("test-plugin-drive")
+        def _factory(env):
+            return SimulatedDrive()
+
+        try:
+            drive = drive_from_env({"OPENCASTOR_DRIVE": "test-plugin-drive"})
+            assert type(drive).__name__ == "SimulatedDrive"
+        finally:
+            del DRIVE_FACTORIES["test-plugin-drive"]
+
+
+class TestDifferentialMixer:
+    """Tank steering as arithmetic, pinned before any chassis exists."""
+
+    class TwoChannel:
+        def __init__(self):
+            self.last = None
+
+        def set_drive(self, left, right):
+            self.last = (left, right)
+
+        def neutral(self):
+            self.last = (0.0, 0.0)
+
+    def _mix(self, throttle, steering):
+        from rc_car_actuator.drive import DifferentialMixer
+
+        device = self.TwoChannel()
+        DifferentialMixer(device).set_drive(throttle, steering)
+        return device.last
+
+    def test_straight_ahead_drives_both_sides_equally(self):
+        assert self._mix(0.5, 0.0) == (0.5, 0.5)
+
+    def test_a_turn_speeds_the_outer_side_and_slows_the_inner(self):
+        left, right = self._mix(0.5, 0.3)
+        assert left == pytest.approx(0.8)
+        assert right == pytest.approx(0.2)
+
+    def test_full_throttle_plus_full_turn_clamps_rather_than_scales(self):
+        # 2.0 asked of the outer wheel becomes 1.0; the inner stays 0.0. Turns
+        # wider than asked, never slower than asked — the governor above
+        # believes its speed model.
+        assert self._mix(1.0, 1.0) == (1.0, 0.0)
+
+    def test_spin_in_place(self):
+        assert self._mix(0.0, 1.0) == (1.0, -1.0)
+
+    def test_reverse_mixes_the_same_way(self):
+        left, right = self._mix(-0.5, 0.3)
+        assert left == pytest.approx(-0.2)
+        assert right == pytest.approx(-0.8)
+
+    def test_nan_becomes_neutral_not_an_undefined_pulse(self):
+        assert self._mix(float("nan"), 0.4) == (0.4, -0.4)
+
+    def test_neutral_passes_through(self):
+        from rc_car_actuator.drive import DifferentialMixer
+
+        device = self.TwoChannel()
+        DifferentialMixer(device).neutral()
+        assert device.last == (0.0, 0.0)
+
+    def test_the_probe_passes_through_when_the_device_has_one(self):
+        from rc_car_actuator.drive import DifferentialMixer
+
+        class Probeable(self.TwoChannel):
+            def reachable(self):
+                return "gone"
+
+        assert DifferentialMixer(Probeable()).reachable() == "gone"
+        assert DifferentialMixer(self.TwoChannel()).reachable() is None

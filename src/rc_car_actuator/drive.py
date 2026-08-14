@@ -45,6 +45,41 @@ class DriveHardware(Protocol):
     def neutral(self) -> None: ...
 
 
+class DifferentialMixer:
+    """Tank steering on top of any two-channel PWM device.
+
+    A differential chassis — two motors, no steering servo — takes the same
+    (throttle, steering) command a car does and resolves it into left/right
+    wheel speeds: left = throttle + steering, right = throttle - steering.
+    Wrapping rather than subclassing, so ANY device that can hold two
+    independent pulses (PCA9685, Maestro, pigpio pins) becomes a tank base with
+    zero new wire-level code — the wrapped device's "throttle" channel drives
+    the LEFT side and its "steering" channel the RIGHT.
+
+    THE MIX IS CLAMPED PER SIDE, NOT SCALED. Full forward plus full turn asks
+    the outer wheel for 2.0; clamping holds it at 1.0 and keeps the inner wheel
+    at 0.0, which turns wider than asked rather than slower than asked. The
+    alternative — scaling both down to preserve the ratio — quietly halves the
+    speed the moment any turn is commanded, and a governor that believes its
+    speed model is the layer above this one.
+    """
+
+    def __init__(self, device: DriveHardware):
+        self._device = device
+
+    def set_drive(self, throttle: float, steering: float) -> None:
+        left = clamp(clamp(throttle) + clamp(steering))
+        right = clamp(clamp(throttle) - clamp(steering))
+        self._device.set_drive(left, right)
+
+    def neutral(self) -> None:
+        self._device.neutral()
+
+    def reachable(self):  # noqa: ANN201 - mirrors the optional probe protocol
+        probe = getattr(self._device, "reachable", None)
+        return probe() if callable(probe) else None
+
+
 def clamp(value: float, limit: float = FULL_SCALE) -> float:
     """Constrain to +/-limit, mapping NaN to 0.
 

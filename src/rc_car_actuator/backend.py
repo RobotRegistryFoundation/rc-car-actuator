@@ -80,6 +80,50 @@ def _bool(env, name: str, default: bool = False) -> bool:  # noqa: ANN001
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+#: Built-in backends, name -> factory(env). A dict rather than an if-chain so
+#: that adding a driver is a registration, not an edit to dispatch logic — and
+#: so the error message below can enumerate what actually exists rather than
+#: hand-maintaining a list that drifts.
+DRIVE_FACTORIES: dict[str, object] = {}
+
+
+def register_drive(name: str):  # noqa: ANN201
+    """Register a drive factory under a backend name.
+
+    The factory takes the environment mapping and returns a DriveHardware.
+    Names are matched lowercase.
+    """
+    def wrap(factory):  # noqa: ANN001, ANN202
+        DRIVE_FACTORIES[name.lower()] = factory
+        return factory
+    return wrap
+
+
+def _discover_plugin_drives() -> None:
+    """Pull in drive factories installed by OTHER packages.
+
+    The same convention the gateway already uses for actuators
+    (`robot_md_gateway.actuators`): a package ships
+    `[project.entry-points."rc_car_actuator.drives"]  mydrive = pkg.mod:factory`
+    and its name becomes valid in OPENCASTOR_DRIVE with no edit here. Built-ins
+    win a name collision — a pip install must not be able to silently replace
+    what `pca9685` means on a vehicle that is already trusted to move.
+    """
+    try:
+        from importlib.metadata import entry_points
+    except ImportError:  # pragma: no cover - stdlib since 3.8
+        return
+    for ep in entry_points(group="rc_car_actuator.drives"):
+        if ep.name.lower() in DRIVE_FACTORIES:
+            logger.warning("plugin drive %r ignored: a built-in owns that name", ep.name)
+            continue
+        try:
+            DRIVE_FACTORIES[ep.name.lower()] = ep.load()
+        except Exception:  # noqa: BLE001
+            # A broken plugin must not take down the vehicle's own drivers.
+            logger.exception("plugin drive %r failed to load", ep.name)
+
+
 def drive_from_env(environ: dict[str, str] | None = None) -> DriveHardware:
     """Construct the drive layer named by the environment.
 
@@ -92,18 +136,43 @@ def drive_from_env(environ: dict[str, str] | None = None) -> DriveHardware:
     if name in {"simulated", "sim", "none"}:
         return SimulatedDrive()
 
-    if name == "pca9685":
-        return install_shutdown_neutral(_pca9685_from_env(env))
+    _discover_plugin_drives()
+    factory = DRIVE_FACTORIES.get(name)
+    if factory is None:
+        known = ", ".join(sorted(["simulated", *DRIVE_FACTORIES]))
+        raise DriveConfigError(
+            f"{ENV_BACKEND}={name!r} is not a known drive backend ({known})")
+    return install_shutdown_neutral(factory(env))
 
-    if name == "maestro":
-        return install_shutdown_neutral(_maestro_from_env(env))
 
-    if name == "pigpio":
-        return install_shutdown_neutral(_pigpio_from_env(env))
+@register_drive("pca9685")
+def _pca9685_drive(env):  # noqa: ANN001, ANN202
+    return _pca9685_from_env(env)
 
-    raise DriveConfigError(
-        f"{ENV_BACKEND}={name!r} is not a known drive backend "
-        f"(simulated, pca9685, maestro, pigpio)")
+
+@register_drive("maestro")
+def _maestro_drive(env):  # noqa: ANN001, ANN202
+    return _maestro_from_env(env)
+
+
+@register_drive("pigpio")
+def _pigpio_drive(env):  # noqa: ANN001, ANN202
+    return _pigpio_from_env(env)
+
+
+@register_drive("pca9685-tank")
+def _pca9685_tank(env):  # noqa: ANN001, ANN202
+    """Differential chassis on a PCA9685: two motor ESCs, no steering servo.
+
+    The chip-level trims keep their meanings per SIDE — the THROTTLE-prefixed
+    channel is the LEFT motor and the STEERING-prefixed one the RIGHT — because
+    the measurements are still per-channel facts (where each ESC sits still,
+    which way each motor is wound). 🔴 HARDWARE-UNTESTED: the mixer is pinned by
+    unit test, but no two-motor chassis has been wired to this yet.
+    """
+    from .drive import DifferentialMixer
+
+    return DifferentialMixer(_pca9685_from_env(env))
 
 
 def install_shutdown_neutral(drive: DriveHardware) -> DriveHardware:
