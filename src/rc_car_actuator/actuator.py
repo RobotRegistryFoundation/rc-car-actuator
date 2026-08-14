@@ -388,6 +388,13 @@ class RCCarActuator:
 
     def read_state(self) -> dict:
         throttle, steering = self._last_command
+        # Probed here rather than cached, because the interesting case is the
+        # chip going away DURING a session, which a value captured at startup
+        # can never notice.
+        probe = getattr(self._hw, "reachable", None)
+        hardware_detail = probe() if callable(probe) else None
+        hardware_reachable = None if not callable(probe) else (hardware_detail is None)
+
         return {
             "throttle": throttle,
             "steering": steering,
@@ -402,6 +409,13 @@ class RCCarActuator:
             "max_throttle": self._max_throttle,
             "commands_accepted": self._commands,
             "hardware": type(self._hw).__name__,
+            # Whether the chip is ANSWERING, not merely which class was
+            # constructed. Without this the telemetry reported a healthy robot
+            # while 0x40 was absent from the bus — see PCA9685Drive.reachable.
+            # None on backends that cannot be probed, which is honestly
+            # "unknown" rather than a cheerful True.
+            "hardware_reachable": hardware_reachable,
+            "hardware_detail": hardware_detail,
             # The honest caveat, carried in telemetry so it reaches anyone
             # reading state rather than only anyone reading the source.
             "stop_layers": ["software deadman (this process)"],

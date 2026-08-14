@@ -82,13 +82,40 @@ def test_construction_centres_both_channels_before_anything_can_command_motion(b
     assert bus.pulse_us(1) == pytest.approx(1500, abs=3)
 
 
-def test_a_bus_that_fails_during_setup_produces_no_drive_object(bus):
-    # If the object existed, something could call set_drive on a chip that was
-    # never configured — which out of reset is running at 200 Hz, a rate a servo
-    # reads as a permanent full-travel command.
+def test_a_bus_that_fails_during_setup_still_produces_a_drive_that_ADMITS_IT(bus):
+    # CONTRACT CHANGED DELIBERATELY. This used to require construction to raise,
+    # on the reasoning that an object must never exist for a chip that was never
+    # configured (out of reset it runs at 200 Hz, which a servo reads as a
+    # permanent full-travel command).
+    #
+    # That reasoning protected the wrong thing. On this vehicle the PCA9685 is
+    # powered from the ESC's BEC, so it is absent whenever the RC pack is flat,
+    # unplugged or charging — most of the time somebody is working on the car.
+    # Raising here killed the gateway at startup and crash-looped it: no status,
+    # no telemetry, no way to ask the robot what was wrong. And it bought
+    # nothing, because set_drive raises on the same bus error regardless. The
+    # only thing refusing to construct prevented was FINDING OUT.
+    #
+    # So: the object exists, reports itself unreachable, and still cannot drive.
     bus.fail_on_register = _PRESCALE
+    drive = PCA9685Drive(bus, channels=NO_ARMING)
+    assert drive.reachable() is not None, "an unconfigured chip must not read as healthy"
     with pytest.raises(OSError):
-        PCA9685Drive(bus, channels=NO_ARMING)
+        drive.set_drive(0.2, 0.0)
+
+
+def test_the_drive_RECOVERS_when_the_chip_comes_back(bus):
+    # Plugging the pack back in must not need a service restart.
+    bus.fail_on_register = _PRESCALE
+    drive = PCA9685Drive(bus, channels=NO_ARMING)
+    assert drive.reachable() is not None
+
+    bus.fail_on_register = None
+    assert drive.reachable() is None, "the chip answered again and was not brought up"
+    # And it is genuinely configured now, not merely answering: centred, at the
+    # right frame rate, rather than left at the 200 Hz a reset leaves behind.
+    assert bus.pulse_us(0) == pytest.approx(1500, abs=3)
+    assert bus.pulse_us(1) == pytest.approx(1500, abs=3)
 
 
 def test_the_frame_rate_is_written_while_the_chip_is_asleep(bus):
@@ -391,3 +418,59 @@ def _throttle_sequence(bus):
             counts = pending[channel].get(2, 0) | (val << 8)
             out.append((channel, counts * (1_000_000.0 / DEFAULT_FRAME_HZ) / 4096.0))
     return out
+
+
+class TestReachability:
+    """The chip that vanished while telemetry kept saying everything was fine.
+
+    On the bench the PCA9685 dropped off the bus mid-session: i2cdetect lost
+    0x40 while the fuel gauge two addresses down kept answering. Every drive.set
+    failed with OSError 121, and status.report still reported
+    hardware=PCA9685Drive, throttle 0.0, no error field.
+    """
+
+    def test_a_present_chip_reports_reachable(self):
+        from rc_car_actuator.pca9685 import PCA9685Drive
+
+        drive = PCA9685Drive(bus=FakeBus())
+        assert drive.reachable() is None
+
+    def test_a_vanished_chip_reports_why(self):
+        from rc_car_actuator.pca9685 import PCA9685Drive
+
+        bus = FakeBus()
+        drive = PCA9685Drive(bus=bus)
+
+        def gone(addr, register):
+            raise OSError(121, "Remote I/O error")
+
+        bus.read_byte_data = gone
+        detail = drive.reachable()
+        assert detail is not None
+        assert "121" in detail or "Remote I/O" in detail
+
+    def test_telemetry_admits_the_chip_is_gone(self):
+        """The actual regression: a green-looking robot that cannot move."""
+        from rc_car_actuator.actuator import RCCarActuator
+        from rc_car_actuator.pca9685 import PCA9685Drive
+
+        bus = FakeBus()
+        actuator = RCCarActuator(hardware=PCA9685Drive(bus=bus))
+        assert actuator.read_state()["hardware_reachable"] is True
+
+        def gone(addr, register):
+            raise OSError(121, "Remote I/O error")
+
+        bus.read_byte_data = gone
+        telemetry = actuator.read_state()
+        assert telemetry["hardware"] == "PCA9685Drive"
+        assert telemetry["hardware_reachable"] is False, "reported healthy with no chip"
+        assert telemetry["hardware_detail"]
+
+    def test_a_backend_that_cannot_be_probed_says_unknown_not_yes(self):
+        from rc_car_actuator.actuator import RCCarActuator
+        from rc_car_actuator.drive import SimulatedDrive
+
+        telemetry = RCCarActuator(hardware=SimulatedDrive()).read_state()
+        # None means "no answer available". True would be a claim nothing checked.
+        assert telemetry["hardware_reachable"] is None

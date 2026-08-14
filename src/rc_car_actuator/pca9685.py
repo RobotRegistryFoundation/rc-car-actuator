@@ -164,15 +164,48 @@ class PCA9685Drive:
         self._stop_requested = threading.Event()
         self._last_throttle = 0.0
 
-        self._configure()
-        # Before the object exists, so nothing can drive through an uncentred
-        # channel. If this raises, there is no PCA9685Drive to command.
-        self.neutral()
-        # Hold that neutral long enough for an ESC to arm. At construction only,
-        # so it never delays a command or a stop.
-        if self._ch.arm_delay_s > 0:
+        # STARTS EVEN IF THE CHIP IS NOT THERE, and says so.
+        #
+        # On this vehicle the PCA9685's supply comes off the ESC's BEC, so the
+        # chip is ABSENT FROM THE BUS whenever the RC pack is flat, unplugged or
+        # on charge — which is most of the time a person is working on the car.
+        # Construction used to raise there, and the gateway died on startup and
+        # crash-looped: no status, no telemetry, no way to ask the robot what was
+        # wrong. A robot that vanishes when a battery goes flat is far harder to
+        # diagnose than one that answers "0x40 is not responding".
+        #
+        # Refusing to construct also bought nothing. Nothing can be driven
+        # through an absent chip in any case — `set_drive` raises on the same
+        # bus error — so the only thing the old behaviour prevented was FINDING
+        # OUT. Actuation still fails closed; only observability changed.
+        self._ready = False
+        self._bring_up()
+
+    def _bring_up(self) -> bool:
+        """Configure, centre and arm. True if the chip answered.
+
+        Retried on demand rather than once at startup, so plugging the pack back
+        in recovers the drive without restarting the service.
+        """
+        try:
+            self._configure()
+            # Before anything can be commanded, so nothing drives through an
+            # uncentred channel.
+            self.neutral()
+        except OSError as exc:
+            self._ready = False
+            logger.error("PCA9685 at 0x%02x is not answering (%s) — the drive "
+                         "layer is present but unusable until it returns; on "
+                         "this vehicle that usually means the RC pack is off",
+                         self._address, exc)
+            return False
+        # Hold that neutral long enough for an ESC to arm. Only when the chip
+        # has just come up, so it never delays a command or a stop.
+        if not self._ready and self._ch.arm_delay_s > 0:
             time.sleep(self._ch.arm_delay_s)
             logger.info("ESC arming: held neutral for %.2fs", self._ch.arm_delay_s)
+        self._ready = True
+        return True
 
     # -- setup ---------------------------------------------------------------
 
@@ -231,6 +264,19 @@ class PCA9685Drive:
     # -- the DriveHardware contract -----------------------------------------
 
     def set_drive(self, throttle: float, steering: float) -> None:
+        # NEVER COMMAND A CHIP THAT WAS NEVER CONFIGURED.
+        #
+        # Present on the bus is not the same as ready. Out of reset the PCA9685
+        # runs at 200 Hz, which a servo reads as a permanent full-travel
+        # command, and writing a perfectly correct pulse WIDTH into a frame that
+        # short produces full lock rather than the angle asked for. Letting
+        # construction survive an absent chip opened exactly this hole — the
+        # chip can now come back mid-session, answering writes while still
+        # unconfigured — and this package's own test caught it.
+        if not self._ready and not self._bring_up():
+            raise OSError(
+                f"PCA9685 at 0x{self._address:02x} is not configured and did "
+                f"not answer; refusing to command an unconfigured chip")
         # A new drive command means driving is intended again, so any stop that
         # aborted a previous arming sequence stops suppressing this one.
         self._stop_requested.clear()
@@ -341,6 +387,35 @@ class PCA9685Drive:
 
     def _read(self, register: int) -> int:
         return self._bus.read_byte_data(self._address, register)
+
+    def reachable(self) -> str | None:
+        """None if the chip answers, else why it does not.
+
+        MEASURED, NOT ASSUMED. On the bench the PCA9685 dropped off the bus
+        mid-session — `i2cdetect` lost 0x40 while the fuel gauge two addresses
+        down kept answering, so the bus was fine and the chip was not. Every
+        `drive.set` then failed with `OSError 121 Remote I/O error`, and
+        `status.report` went on saying `hardware: PCA9685Drive`, throttle 0.0,
+        no error field: a perfectly healthy-looking robot that could not move a
+        wheel. The phone would have shown green.
+
+        A one-byte MODE1 read, so it is cheap enough to run on every telemetry
+        sample. Reporting reachability is not the same as reporting that the
+        WHEELS work — the ESC, its battery and the motor are all past this point
+        and none of them answer questions.
+        """
+        try:
+            self._read(_MODE1)
+        except Exception as exc:  # noqa: BLE001 - any bus error means absent
+            self._ready = False
+            return f"{type(exc).__name__}: {exc}"
+        # The chip is answering but was never configured — it came back after
+        # being away, so bring it up rather than reporting a healthy chip that
+        # is still running at whatever frame rate its reset left it at. 200 Hz
+        # out of a reset is a permanent full-travel command to a servo.
+        if not self._ready and not self._bring_up():
+            return "present but could not be configured"
+        return None
 
 
 def open_smbus_drive(address: int = 0x40, i2c_bus: int = 1,
