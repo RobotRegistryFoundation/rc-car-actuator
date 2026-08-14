@@ -33,6 +33,7 @@ from __future__ import annotations
 import logging
 import math
 import threading
+import time
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -62,6 +63,24 @@ NOMINAL_OSCILLATOR_HZ = 25_000_000
 #: Servo/ESC frame rate. 50 Hz is the hobby-RC standard; a 20 ms frame with a
 #: 1000-2000 us pulse inside it.
 DEFAULT_FRAME_HZ = 50
+
+#: Absolute pulse-width bounds, microseconds. Below/above these risks damaging a
+#: servo or confusing an ESC into a state it will not leave.
+#:
+#: Ported from castor's own PCA9685 RC driver rather than reinvented — the same
+#: numbers, for the same reason. They are a HARD clamp at the write, not a
+#: validation at config time, because the trim values are per-vehicle and can be
+#: edited by hand: a fat-fingered `neutral_us=15000` must become a safe pulse,
+#: not a 15 ms one.
+PULSE_MIN_US = 500
+PULSE_MAX_US = 2500
+
+
+def clamp_pulse_us(pulse_us: float) -> float:
+    """Constrain a pulse width to what a servo or ESC can survive."""
+    if pulse_us != pulse_us:      # NaN
+        return float(PULSE_MIN_US)
+    return max(float(PULSE_MIN_US), min(float(PULSE_MAX_US), float(pulse_us)))
 
 
 class I2CBus(Protocol):
@@ -95,6 +114,29 @@ class DriveChannels:
     #: the nominal value is used and the CAR STAYS ON A STAND.
     oscillator_hz: int = NOMINAL_OSCILLATOR_HZ
 
+    #: Seconds of held neutral at construction, so an ESC recognises the signal
+    #: and arms. Ported from castor's RC driver, which waits 0.5 s. Costs half a
+    #: second once, at startup, OUTSIDE the command path — an ESC that never
+    #: armed simply ignores everything afterwards, which reads as dead wiring.
+    arm_delay_s: float = 0.5
+
+    #: Most hobby ESCs ignore a reverse pulse unless they get a brief neutral
+    #: first, and some need two neutral→reverse cycles.
+    #:
+    #: 🔴 OFF BY DEFAULT HERE, unlike castor's driver, and the difference is the
+    #: layer. castor's runs in a request handler; this one sits under a deadman
+    #: with a 50 ms watchdog, and the arming sequence SLEEPS. A stop that had to
+    #: wait for an ESC handshake would be a stop that arrives up to 600 ms late,
+    #: and "stopping never waits" is the one rule this package is built around.
+    #: Turn it on once you know your ESC needs it; the sequence is abortable and
+    #: a stop cuts it short (see `set_drive`).
+    esc_reverse_arming: bool = False
+    esc_arm_neutral_ms: int = 200
+    esc_double_tap_reverse: bool = False
+    #: Below this magnitude a throttle request counts as neutral, so noise around
+    #: zero does not repeatedly re-trigger the reverse handshake.
+    throttle_deadzone: float = 0.02
+
 
 class PCA9685Drive:
     """`DriveHardware` over a PCA9685. Same contract as `SimulatedDrive`.
@@ -118,10 +160,19 @@ class PCA9685Drive:
             # input, and the first left turn is a launch.
             raise ValueError("throttle and steering cannot share a PCA9685 channel")
 
+        # Set BEFORE neutral(), which consults it.
+        self._stop_requested = threading.Event()
+        self._last_throttle = 0.0
+
         self._configure()
         # Before the object exists, so nothing can drive through an uncentred
         # channel. If this raises, there is no PCA9685Drive to command.
         self.neutral()
+        # Hold that neutral long enough for an ESC to arm. At construction only,
+        # so it never delays a command or a stop.
+        if self._ch.arm_delay_s > 0:
+            time.sleep(self._ch.arm_delay_s)
+            logger.info("ESC arming: held neutral for %.2fs", self._ch.arm_delay_s)
 
     # -- setup ---------------------------------------------------------------
 
@@ -180,13 +231,71 @@ class PCA9685Drive:
     # -- the DriveHardware contract -----------------------------------------
 
     def set_drive(self, throttle: float, steering: float) -> None:
+        # A new drive command means driving is intended again, so any stop that
+        # aborted a previous arming sequence stops suppressing this one.
+        self._stop_requested.clear()
+        if self._needs_reverse_arming(throttle):
+            if self._arm_reverse(throttle):
+                # A STOP ARRIVED DURING THE HANDSHAKE, SO DO NOT DRIVE.
+                #
+                # Caught by this package's own test. Abandoning the handshake
+                # was not enough: control fell through to the throttle write
+                # below and the car pulled away AFTER a stop — which is the one
+                # outcome nothing in this package is allowed to produce. The
+                # wheels are already neutral; the stop put them there.
+                self._last_throttle = 0.0
+                return
         with self._lock:
             self._write_channel(self._ch.steering, steering)
             # Throttle LAST on the way up, so a failure partway through leaves
             # the car not-moving rather than moving-and-unsteerable.
             self._write_channel(self._ch.throttle, throttle)
+        self._last_throttle = clamp(throttle)
+
+    def _needs_reverse_arming(self, throttle: float) -> bool:
+        """Only on the forward→reverse transition, and only if configured."""
+        if not self._ch.esc_reverse_arming:
+            return False
+        dead = self._ch.throttle_deadzone
+        return clamp(throttle) < -dead and self._last_throttle >= -dead
+
+    def _arm_reverse(self, throttle: float) -> bool:
+        """Neutral, pause, (optionally reverse-neutral again), then let the caller drive.
+
+        Returns True when a stop cut the sequence short, in which case the
+        caller must NOT go on to drive.
+
+        THE SLEEPS DO NOT HOLD THE LOCK, and every pause is really a wait on the
+        stop event. That is what keeps this compatible with a deadman: a stop
+        arriving mid-handshake takes the lock immediately, writes neutral, and
+        cuts the remaining steps rather than queueing behind them.
+        """
+        step = max(0.0, self._ch.esc_arm_neutral_ms / 1000.0)
+
+        def pause() -> bool:
+            """True when a stop arrived and the sequence should be abandoned."""
+            return self._stop_requested.wait(timeout=step)
+
+        with self._lock:
+            self._write_channel(self._ch.throttle, 0.0)
+        if pause():
+            return True
+        if not self._ch.esc_double_tap_reverse:
+            return False
+        for value in (throttle, 0.0):
+            if self._stop_requested.is_set():
+                return True
+            with self._lock:
+                self._write_channel(self._ch.throttle, value)
+            if pause():
+                return True
+        return False
 
     def neutral(self) -> None:
+        # Set FIRST, so an arming sequence sleeping between writes abandons the
+        # rest of itself instead of driving again after this returns.
+        self._stop_requested.set()
+        self._last_throttle = 0.0
         with self._lock:
             try:
                 self._write_channel(self._ch.throttle, 0.0)
@@ -213,7 +322,10 @@ class PCA9685Drive:
     # -- wire ----------------------------------------------------------------
 
     def _write_channel(self, channel: Channel, value: float) -> None:
-        off = self.counts(channel.pulse_us(value))
+        # Clamped to the absolute survivable range before anything reaches the
+        # chip, so a mistyped trim in a config file cannot emit a pulse that
+        # damages a servo.
+        off = self.counts(clamp_pulse_us(channel.pulse_us(value)))
         base = _LED0_ON_L + 4 * channel.index
         # ON is always 0: the pulse starts at the top of every frame and its
         # width is the OFF count. Phase-shifting channels would spread the

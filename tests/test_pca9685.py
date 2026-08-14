@@ -59,16 +59,24 @@ def bus():
     return FakeBus()
 
 
+#: Arming is a real half-second of held neutral on real hardware. Tests opt out
+#: rather than the default being lowered: the delay exists so an ESC recognises
+#: the signal, and a suite that quietly made it zero would be testing a driver
+#: nobody ships. It also perturbs the deadman's timing in the envelope tests,
+#: which is how this was noticed.
+NO_ARMING = DriveChannels(throttle=Channel(0), steering=Channel(1), arm_delay_s=0)
+
+
 @pytest.fixture
 def drive(bus):
-    return PCA9685Drive(bus)
+    return PCA9685Drive(bus, channels=NO_ARMING)
 
 
 # -- arming ------------------------------------------------------------------
 
 
 def test_construction_centres_both_channels_before_anything_can_command_motion(bus):
-    drive = PCA9685Drive(bus)
+    drive = PCA9685Drive(bus, channels=NO_ARMING)
     assert drive.counts(1500.0) == bus.pulse_counts(0)
     assert bus.pulse_us(0) == pytest.approx(1500, abs=3)
     assert bus.pulse_us(1) == pytest.approx(1500, abs=3)
@@ -80,14 +88,14 @@ def test_a_bus_that_fails_during_setup_produces_no_drive_object(bus):
     # reads as a permanent full-travel command.
     bus.fail_on_register = _PRESCALE
     with pytest.raises(OSError):
-        PCA9685Drive(bus)
+        PCA9685Drive(bus, channels=NO_ARMING)
 
 
 def test_the_frame_rate_is_written_while_the_chip_is_asleep(bus):
     # The prescale register is write-protected unless SLEEP is set. Written to an
     # awake chip it is silently ignored, and the outputs keep running at the
     # reset default with no error anywhere.
-    PCA9685Drive(bus)
+    PCA9685Drive(bus, channels=NO_ARMING)
     order = [reg for _, reg, _ in bus.writes]
     mode1_before_prescale = [
         value for (_, reg, value), position in zip(bus.writes, range(len(bus.writes)))
@@ -98,7 +106,7 @@ def test_the_frame_rate_is_written_while_the_chip_is_asleep(bus):
 
 
 def test_the_chip_is_woken_after_configuration(bus):
-    PCA9685Drive(bus)
+    PCA9685Drive(bus, channels=NO_ARMING)
     assert not bus.registers[_MODE1] & 0x10, "SLEEP must be cleared before driving"
 
 
@@ -106,7 +114,7 @@ def test_sharing_a_channel_between_throttle_and_steering_is_refused(bus):
     # One channel driving both means every steering input is a throttle input,
     # and the first left turn is a launch.
     with pytest.raises(ValueError):
-        PCA9685Drive(bus, channels=DriveChannels(throttle=Channel(0),
+        PCA9685Drive(bus, channels=DriveChannels(arm_delay_s=0, throttle=Channel(0),
                                                  steering=Channel(0)))
 
 
@@ -191,6 +199,7 @@ def test_a_trimmed_neutral_is_what_gets_written(bus):
     # the wheels straight. Hardcoding 1500 for both is how a car creeps at rest
     # and tracks five degrees left.
     drive = PCA9685Drive(bus, channels=DriveChannels(
+        arm_delay_s=0,
         throttle=Channel(0, neutral_us=1480),
         steering=Channel(1, neutral_us=1520)))
     drive.neutral()
@@ -201,6 +210,7 @@ def test_a_trimmed_neutral_is_what_gets_written(bus):
 def test_a_narrowed_span_protects_a_linkage_that_binds(bus):
     # A servo pushing against a mechanical bind stalls, heats, and dies.
     drive = PCA9685Drive(bus, channels=DriveChannels(
+        arm_delay_s=0,
         throttle=Channel(0),
         steering=Channel(1, span_us=300)))
     drive.set_drive(0.0, 1.0)
@@ -209,6 +219,7 @@ def test_a_narrowed_span_protects_a_linkage_that_binds(bus):
 
 def test_inverting_a_channel_flips_it(bus):
     drive = PCA9685Drive(bus, channels=DriveChannels(
+        arm_delay_s=0,
         throttle=Channel(0, invert=True), steering=Channel(1)))
     drive.set_drive(1.0, 0.0)
     assert bus.pulse_us(0) == pytest.approx(1000, abs=3)
@@ -262,3 +273,121 @@ def test_it_satisfies_the_same_protocol_the_deadman_drives(bus, drive):
     assert required <= set(dir(drive))
     assert required <= set(dir(SimulatedDrive))
     assert math.isclose(bus.pulse_us(0), 1500, abs_tol=3)
+
+
+# -- pulse-width bounds, ported from castor's RC driver ----------------------
+
+
+def test_a_mistyped_trim_cannot_emit_a_pulse_that_damages_a_servo(bus):
+    # The trims are per-vehicle numbers edited by hand in a config file. A fat
+    # fingered 15000 must become a survivable pulse, not a 15 ms one.
+    from rc_car_actuator.pca9685 import PULSE_MAX_US, PULSE_MIN_US
+
+    drive = PCA9685Drive(bus, channels=DriveChannels(
+        arm_delay_s=0,
+        throttle=Channel(0, neutral_us=15000),
+        steering=Channel(1, neutral_us=10)))
+    drive.neutral()
+    assert bus.pulse_us(0) == pytest.approx(PULSE_MAX_US, abs=3)
+    assert bus.pulse_us(1) == pytest.approx(PULSE_MIN_US, abs=3)
+
+
+def test_the_bounds_are_the_same_numbers_castor_uses():
+    # Ported, not reinvented. If these drift apart, two drivers on one robot
+    # disagree about what is safe to send the same ESC.
+    from rc_car_actuator.pca9685 import PULSE_MAX_US, PULSE_MIN_US
+
+    assert (PULSE_MIN_US, PULSE_MAX_US) == (500, 2500)
+
+
+# -- ESC arming --------------------------------------------------------------
+
+
+def test_construction_holds_neutral_long_enough_for_an_ESC_to_arm(bus, monkeypatch):
+    slept: list[float] = []
+    monkeypatch.setattr("rc_car_actuator.pca9685.time.sleep", slept.append)
+    PCA9685Drive(bus)                     # default channels => default arm delay
+    assert slept and slept[0] == pytest.approx(0.5), \
+        "an ESC that never armed ignores everything afterwards"
+    assert bus.pulse_us(0) == pytest.approx(1500, abs=3), "and it is NEUTRAL it holds"
+
+
+def test_reverse_arming_is_OFF_by_default_at_this_layer(bus, monkeypatch):
+    # castor's driver defaults it on; this one sits under a 50 ms deadman
+    # watchdog and the handshake sleeps. A stop must never wait on an ESC.
+    slept: list[float] = []
+    monkeypatch.setattr("rc_car_actuator.pca9685.time.sleep", slept.append)
+    drive = PCA9685Drive(bus, channels=NO_ARMING)
+    drive.set_drive(0.4, 0.0)
+    drive.set_drive(-0.4, 0.0)
+    assert slept == [], "no handshake unless the operator asked for one"
+
+
+def test_reverse_arming_sends_neutral_first_when_enabled(bus):
+    ch = DriveChannels(arm_delay_s=0, throttle=Channel(0), steering=Channel(1),
+                       esc_reverse_arming=True, esc_arm_neutral_ms=1)
+    drive = PCA9685Drive(bus, channels=ch)
+    drive.set_drive(0.4, 0.0)
+    bus.writes.clear()
+    drive.set_drive(-0.4, 0.0)
+    # Neutral before the reverse pulse: the whole point of the handshake.
+    throttles = [t for c, t in _throttle_sequence(bus) if c == 0]
+    assert throttles[0] == pytest.approx(1500, abs=3)
+    assert throttles[-1] == pytest.approx(1300, abs=3)
+
+
+def test_only_the_forward_to_reverse_TRANSITION_arms(bus):
+    ch = DriveChannels(arm_delay_s=0, throttle=Channel(0), steering=Channel(1),
+                       esc_reverse_arming=True, esc_arm_neutral_ms=1)
+    drive = PCA9685Drive(bus, channels=ch)
+    drive.set_drive(-0.4, 0.0)      # first reverse: arms
+    bus.writes.clear()
+    drive.set_drive(-0.6, 0.0)      # still reverse: must NOT re-handshake
+    throttles = [t for c, t in _throttle_sequence(bus) if c == 0]
+    assert throttles == [pytest.approx(1200, abs=3)]
+
+
+def test_A_STOP_CUTS_THE_HANDSHAKE_SHORT(bus):
+    """The rule this whole layer is built around: stopping never waits.
+
+    A reverse handshake can sleep for hundreds of milliseconds. If a deadman
+    expiry had to queue behind it, a stop would land late by exactly that much.
+    So every pause is a wait on the stop event, and neutral() sets it.
+    """
+    import threading
+
+    ch = DriveChannels(arm_delay_s=0, throttle=Channel(0), steering=Channel(1),
+                       esc_reverse_arming=True, esc_arm_neutral_ms=5000,
+                       esc_double_tap_reverse=True)
+    drive = PCA9685Drive(bus, channels=ch)
+    drive.set_drive(0.4, 0.0)
+
+    done = threading.Event()
+
+    def reverse():
+        drive.set_drive(-0.4, 0.0)
+        done.set()
+
+    threading.Thread(target=reverse, daemon=True).start()
+    import time as _t
+    _t.sleep(0.05)                       # let the handshake begin and block
+    started = _t.monotonic()
+    drive.neutral()                      # the deadman's move
+    assert _t.monotonic() - started < 1.0, "neutral() waited on the handshake"
+    assert done.wait(timeout=2.0), "the handshake never abandoned itself"
+    assert bus.pulse_us(0) == pytest.approx(1500, abs=3), "and it ended at neutral"
+
+
+def _throttle_sequence(bus):
+    """(channel, pulse_us) for every complete channel write, in order."""
+    out = []
+    pending: dict[int, dict[int, int]] = {}
+    for _, reg, val in bus.writes:
+        if reg < _LED0_ON_L:
+            continue
+        channel, offset = divmod(reg - _LED0_ON_L, 4)
+        pending.setdefault(channel, {})[offset] = val
+        if offset == 3:
+            counts = pending[channel].get(2, 0) | (val << 8)
+            out.append((channel, counts * (1_000_000.0 / DEFAULT_FRAME_HZ) / 4096.0))
+    return out

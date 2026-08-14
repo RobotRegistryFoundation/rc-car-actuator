@@ -147,7 +147,20 @@ def test_lease_cannot_outlive_the_budget(car):
     assert measured == pytest.approx(granted, abs=0.15), (
         f"the receipt promised {granted}s and the car drove for {measured:.3f}s "
         f"on a 0.3s budget")
-    assert hw.last == (0.0, 0.0)
+
+    # WAIT for the wheels rather than assuming they are already neutral. The
+    # deadman marks itself expired, releases its lock, logs, and only THEN calls
+    # _safe_stop() — so `lease_alive` goes false a moment before the neutral
+    # write lands, and this assertion was racing the watchdog thread. It failed
+    # about one run in four once unrelated timing shifted.
+    #
+    # The deadman's ordering is right and is not what changes: marking expired
+    # first is what stops a late command from extending a lease that should be
+    # dead. It is the test that has to synchronise.
+    stopped_by = time.monotonic() + 1.0
+    while hw.last != (0.0, 0.0) and time.monotonic() < stopped_by:
+        time.sleep(0.005)
+    assert hw.last == (0.0, 0.0), "the deadman expired but never wrote neutral"
 
 
 def test_the_budget_is_charged_what_the_lease_actually_enforced(car):
