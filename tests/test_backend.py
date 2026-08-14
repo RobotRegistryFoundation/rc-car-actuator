@@ -7,6 +7,8 @@ car.
 """
 from __future__ import annotations
 
+import os
+import signal
 import pytest
 
 from rc_car_actuator.backend import (
@@ -178,3 +180,101 @@ def test_every_documented_drive_variable_is_actually_read():
     assert channels.throttle_deadzone == 0.05
     assert channels.frame_hz == 60
     assert channels.oscillator_hz == 26_000_000
+
+
+class TestShutdownNeutral:
+    """The bench finding: a stopped process left the wheels turning.
+
+    With the car on a stand, 10% throttle was commanded and `rover-gateway` was
+    stopped normally. The process exited in 0.2 s and the PCA9685 went on
+    emitting 1547 us with nothing alive to renew it. The deadman is a thread
+    inside the process, so it died with the process; the chip latches its
+    registers and does not.
+    """
+
+    class Recording:
+        """Minimal DriveHardware that records whether it was quieted."""
+
+        def __init__(self):
+            self.neutral_calls = 0
+
+        def set_drive(self, throttle, steering):
+            pass
+
+        def neutral(self):
+            self.neutral_calls += 1
+
+    def test_atexit_writes_neutral(self):
+        import atexit
+
+        from rc_car_actuator.backend import install_shutdown_neutral
+
+        drive = self.Recording()
+        install_shutdown_neutral(drive)
+        # Fire the registered hook the way interpreter shutdown would.
+        atexit._run_exitfuncs()
+        assert drive.neutral_calls >= 1, "process exit left the chip commanded"
+
+    def test_neutral_is_written_only_once(self):
+        import atexit
+
+        from rc_car_actuator.backend import install_shutdown_neutral
+
+        drive = self.Recording()
+        install_shutdown_neutral(drive)
+        atexit._run_exitfuncs()
+        atexit._run_exitfuncs()
+        # A signal handler and atexit can both fire. The second must not
+        # re-drive a chip the first just quieted.
+        assert drive.neutral_calls == 1
+
+    def test_a_failing_neutral_does_not_raise_out_of_shutdown(self):
+        import atexit
+
+        from rc_car_actuator.backend import install_shutdown_neutral
+
+        class Broken(self.Recording):
+            def neutral(self):
+                raise OSError("i2c wire pulled")
+
+        install_shutdown_neutral(Broken())
+        # Raising here would replace a stopped car with a stack trace and a
+        # moving one.
+        atexit._run_exitfuncs()
+
+    def test_sigterm_writes_neutral_and_still_terminates(self):
+        """End to end in a real subprocess, because signal chaining is the part
+        most likely to be wrong and cannot be checked in-process."""
+        import subprocess
+        import sys
+        import textwrap
+
+        script = textwrap.dedent(
+            """
+            import os, signal, sys, time
+            sys.path.insert(0, os.environ["SRC"])
+            from rc_car_actuator.backend import install_shutdown_neutral
+
+            class D:
+                def set_drive(self, t, s): pass
+                def neutral(self): print("NEUTRAL", flush=True)
+
+            install_shutdown_neutral(D())
+            print("READY", flush=True)
+            time.sleep(30)
+            """
+        )
+        import pathlib
+
+        src = str(pathlib.Path(__file__).resolve().parents[1] / "src")
+        proc = subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE, text=True, env={**os.environ, "SRC": src},
+        )
+        assert proc.stdout.readline().strip() == "READY"
+        proc.send_signal(signal.SIGTERM)
+        out, _ = proc.communicate(timeout=15)
+        assert "NEUTRAL" in out, "SIGTERM left the chip commanded"
+        # SIGTERM must still end the process. A handler that stops the wheels
+        # and then hangs is its own outage.
+        assert proc.returncode is not None

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 
 from .drive import DriveHardware, SimulatedDrive
 
@@ -92,17 +93,85 @@ def drive_from_env(environ: dict[str, str] | None = None) -> DriveHardware:
         return SimulatedDrive()
 
     if name == "pca9685":
-        return _pca9685_from_env(env)
+        return install_shutdown_neutral(_pca9685_from_env(env))
 
     if name == "maestro":
-        return _maestro_from_env(env)
+        return install_shutdown_neutral(_maestro_from_env(env))
 
     if name == "pigpio":
-        return _pigpio_from_env(env)
+        return install_shutdown_neutral(_pigpio_from_env(env))
 
     raise DriveConfigError(
         f"{ENV_BACKEND}={name!r} is not a known drive backend "
         f"(simulated, pca9685, maestro, pigpio)")
+
+
+def install_shutdown_neutral(drive: DriveHardware) -> DriveHardware:
+    """Write neutral when this process goes down.
+
+    MEASURED ON THE BENCH, NOT REASONED ABOUT. With the car on a stand, a 10%
+    throttle was commanded and `rover-gateway` was stopped normally. The process
+    exited in 0.2 s and the PCA9685 went on emitting 1547 us — a live throttle —
+    with nothing alive to renew it. The wheels kept turning.
+
+    The deadman is a THREAD INSIDE THIS PROCESS, so it dies with the process,
+    while the chip does not: a PCA9685 latches its registers and holds the last
+    value indefinitely. Every safety layer above this one — the envelope, the
+    budget, the lease, the signed refusals — is enforced by code that is no
+    longer running. That gap belongs to the last moment of the process, which is
+    the only place still able to close it.
+
+    THIS DOES NOT COVER SIGKILL, a panic, a power cut to the Pi alone, or a
+    pulled I2C wire. Nothing in software can: the handler never runs. A hardware
+    cutoff in the battery line is the only thing that covers those, and this
+    function is not a substitute for one.
+    """
+    import atexit
+    import signal
+
+    done = threading.Event()
+
+    def to_neutral() -> None:
+        # Idempotent: atexit and a signal handler can both fire, and the second
+        # call must not re-drive a chip the first one just quieted.
+        if done.is_set():
+            return
+        done.set()
+        try:
+            drive.neutral()
+        except Exception:  # noqa: BLE001
+            # Nothing above is listening this late, and raising here would
+            # replace a stopped car with a stack trace and a moving one.
+            logger.exception("failed to write neutral during shutdown")
+
+    atexit.register(to_neutral)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            previous = signal.getsignal(sig)
+        except (ValueError, OSError):
+            continue
+
+        def handler(signum, frame, _previous=previous):  # noqa: ANN001, ANN202
+            to_neutral()
+            # Chained rather than replaced. A service manager's shutdown, a
+            # KeyboardInterrupt, or any handler the host installed first still
+            # has to happen; stopping the wheels is an addition to that sequence
+            # and must not become a substitute for it.
+            if callable(_previous):
+                _previous(signum, frame)
+            elif _previous == signal.SIG_DFL:
+                signal.signal(signum, signal.SIG_DFL)
+                os.kill(os.getpid(), signum)
+
+        try:
+            signal.signal(sig, handler)
+        except (ValueError, OSError):
+            # Not the main thread, or a platform without it. The atexit path
+            # still stands.
+            logger.debug("could not install %s handler for drive shutdown", sig)
+
+    return drive
 
 
 def _channel_from_env(env, prefix: str, index_default: int):  # noqa: ANN001, ANN201
