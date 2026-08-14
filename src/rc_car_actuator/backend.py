@@ -170,6 +170,15 @@ def _pca9685_from_env(env) -> DriveHardware:  # noqa: ANN001
         # See `DriveChannels.oscillator_hz`: the chip's 25 MHz is a cheap RC
         # oscillator, and every pulse it emits is scaled by the real figure.
         oscillator_hz=_int(env, "OPENCASTOR_DRIVE_OSCILLATOR_HZ", 25_000_000),
+        # The ESC behaviours. Added after documenting these variables in a
+        # robot's config and then noticing the reader did not read them — a
+        # setting that is written down, looks right, and does nothing is worse
+        # than one that was never offered.
+        arm_delay_s=_float(env, "OPENCASTOR_DRIVE_ARM_DELAY_S", 0.5),
+        esc_reverse_arming=_bool(env, "OPENCASTOR_DRIVE_ESC_REVERSE_ARMING"),
+        esc_arm_neutral_ms=_int(env, "OPENCASTOR_DRIVE_ESC_ARM_NEUTRAL_MS", 200),
+        esc_double_tap_reverse=_bool(env, "OPENCASTOR_DRIVE_ESC_DOUBLE_TAP_REVERSE"),
+        throttle_deadzone=_float(env, "OPENCASTOR_DRIVE_THROTTLE_DEADZONE", 0.02),
     )
     address = _int(env, "OPENCASTOR_DRIVE_I2C_ADDRESS", 0x40)
     bus_number = _int(env, "OPENCASTOR_DRIVE_I2C_BUS", 1)

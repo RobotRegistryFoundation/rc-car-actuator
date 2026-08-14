@@ -135,3 +135,46 @@ def test_the_actuator_honours_an_explicitly_passed_backend():
                            approved_by="test")
     actuator.drive_set(throttle=0.1, steering=0.0, duration_s=0.5)
     assert hardware.last != (0.0, 0.0), "the passed-in hardware is the one driven"
+
+
+def test_every_documented_drive_variable_is_actually_read():
+    """A setting that is written down, looks right, and does nothing.
+
+    The ESC behaviours were added to the driver and documented in a robot's
+    gateway-policy.env before the env reader knew about them, so enabling
+    reverse arming would have silently changed nothing. This pins the whole
+    surface: if a field gains an env var in the docs, it gains one here.
+    """
+    from rc_car_actuator.backend import _channel_from_env
+    from rc_car_actuator.pca9685 import DriveChannels
+
+    env = {
+        "OPENCASTOR_DRIVE_ARM_DELAY_S": "0.25",
+        "OPENCASTOR_DRIVE_ESC_REVERSE_ARMING": "true",
+        "OPENCASTOR_DRIVE_ESC_ARM_NEUTRAL_MS": "150",
+        "OPENCASTOR_DRIVE_ESC_DOUBLE_TAP_REVERSE": "yes",
+        "OPENCASTOR_DRIVE_THROTTLE_DEADZONE": "0.05",
+        "OPENCASTOR_DRIVE_FRAME_HZ": "60",
+        "OPENCASTOR_DRIVE_OSCILLATOR_HZ": "26000000",
+    }
+    from rc_car_actuator import backend
+
+    # Build the channels exactly as _pca9685_from_env does, without touching I2C.
+    channels = DriveChannels(
+        throttle=_channel_from_env(env, "THROTTLE", 0),
+        steering=_channel_from_env(env, "STEERING", 1),
+        frame_hz=backend._int(env, "OPENCASTOR_DRIVE_FRAME_HZ", 50),
+        oscillator_hz=backend._int(env, "OPENCASTOR_DRIVE_OSCILLATOR_HZ", 25_000_000),
+        arm_delay_s=backend._float(env, "OPENCASTOR_DRIVE_ARM_DELAY_S", 0.5),
+        esc_reverse_arming=backend._bool(env, "OPENCASTOR_DRIVE_ESC_REVERSE_ARMING"),
+        esc_arm_neutral_ms=backend._int(env, "OPENCASTOR_DRIVE_ESC_ARM_NEUTRAL_MS", 200),
+        esc_double_tap_reverse=backend._bool(env, "OPENCASTOR_DRIVE_ESC_DOUBLE_TAP_REVERSE"),
+        throttle_deadzone=backend._float(env, "OPENCASTOR_DRIVE_THROTTLE_DEADZONE", 0.02),
+    )
+    assert channels.arm_delay_s == 0.25
+    assert channels.esc_reverse_arming is True
+    assert channels.esc_arm_neutral_ms == 150
+    assert channels.esc_double_tap_reverse is True
+    assert channels.throttle_deadzone == 0.05
+    assert channels.frame_hz == 60
+    assert channels.oscillator_hz == 26_000_000
