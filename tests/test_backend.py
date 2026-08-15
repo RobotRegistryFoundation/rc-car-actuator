@@ -374,3 +374,64 @@ class TestDifferentialMixer:
 
         assert DifferentialMixer(Probeable()).reachable() == "gone"
         assert DifferentialMixer(self.TwoChannel()).reachable() is None
+
+
+class TestBattery:
+    """The fuel-gauge skill, built through the gap rail."""
+
+    class Bus:
+        """Big-endian chip behind a little-endian SMBus word read."""
+
+        def __init__(self, vcell, soc, crate):
+            self.regs = {0x02: vcell, 0x04: soc, 0x16: crate}
+
+        def read_word_data(self, addr, register):
+            be = self.regs[register]
+            return ((be & 0xFF) << 8) | (be >> 8)  # chip order -> smbus order
+
+    def test_reads_voltage_charge_and_trend(self):
+        from rc_car_actuator.battery import MAX1704xFuelGauge
+
+        # 3.998 V, 87.5 %, +12 LSB crate (charging)
+        bus = self.Bus(vcell=round(3.998 / 78.125e-6), soc=int(87.5 * 256), crate=12)
+        got = MAX1704xFuelGauge(bus).read()
+        assert abs(got["voltage_v"] - 3.998) < 0.001
+        assert got["percent"] == 87.5
+        assert got["charging"] is True
+
+    def test_discharge_rate_is_signed_not_a_huge_positive_number(self):
+        # CRATE is signed; reading it unsigned turns "dying at 2 %/hr" into
+        # "charging at 13000 %/hr" — the sign IS the diagnosis.
+        from rc_car_actuator.battery import MAX1704xFuelGauge
+
+        bus = self.Bus(vcell=45000, soc=50 * 256, crate=(-10) & 0xFFFF)
+        got = MAX1704xFuelGauge(bus).read()
+        assert got["rate_pct_per_hr"] < 0
+        assert got["charging"] is False
+
+    def test_a_dead_gauge_reads_none_not_an_exception(self):
+        from rc_car_actuator.battery import MAX1704xFuelGauge
+
+        class Gone:
+            def read_word_data(self, a, r):
+                raise OSError(121, "Remote I/O error")
+
+        assert MAX1704xFuelGauge(Gone()).read() is None
+
+    def test_telemetry_carries_battery_and_survives_its_absence(self):
+        from rc_car_actuator.actuator import RCCarActuator
+        from rc_car_actuator.drive import SimulatedDrive
+
+        actuator = RCCarActuator(hardware=SimulatedDrive())
+        assert actuator.read_state()["battery"] is None  # not configured: unknown
+
+        actuator._battery = type("G", (), {"read": lambda self: {"percent": 42.0}})()
+        assert actuator.read_state()["battery"]["percent"] == 42.0
+
+    def test_opt_in_only_never_probed_by_default(self):
+        from rc_car_actuator.battery import battery_from_env
+
+        # 0x36 answering a read is weak evidence — other parts live there. The
+        # operator saying OPENCASTOR_BATTERY=max1704x is what makes it a gauge.
+        assert battery_from_env({}) is None
+        assert battery_from_env({"OPENCASTOR_BATTERY": "somethingelse"}) is None

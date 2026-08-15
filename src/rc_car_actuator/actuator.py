@@ -137,6 +137,10 @@ class RCCarActuator:
         # See `backend.drive_from_env` for why a requested backend that cannot be
         # built raises instead of quietly falling back.
         self._hw: DriveHardware = hardware if hardware is not None else drive_from_env()
+        # The battery gauge is context, not control: read-only, opt-in via
+        # OPENCASTOR_BATTERY, and permitted to be absent forever.
+        from .battery import battery_from_env
+        self._battery = battery_from_env()
         self._max_throttle = abs(clamp(max_throttle))
         self._last_command: tuple[float, float] = (0.0, 0.0)
         self._commands = 0
@@ -416,6 +420,11 @@ class RCCarActuator:
             # "unknown" rather than a cheerful True.
             "hardware_reachable": hardware_reachable,
             "hardware_detail": hardware_detail,
+            # None when no gauge is configured OR the configured one stopped
+            # answering — both honestly "unknown", never a stale number. The
+            # sensor exists because the drive pack died mid-bench and the
+            # first symptom was the PWM chip falling off the bus.
+            "battery": self._battery.read() if self._battery else None,
             # The honest caveat, carried in telemetry so it reaches anyone
             # reading state rather than only anyone reading the source.
             "stop_layers": ["software deadman (this process)"],
