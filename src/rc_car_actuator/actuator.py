@@ -467,10 +467,21 @@ class RCCarActuator:
 
         try:
             if tool_name == "drive.set":
+                # `.get("duration_s")` WITHOUT a default, and the missing 0.0
+                # is the fix. An ABSENT duration means "no opinion" and takes
+                # the deadman's short default (400 ms); an EXPLICIT 0 is a
+                # zero-length lease and stops the car. Defaulting the absent
+                # case to 0.0 collapsed those two into one, so any client that
+                # omitted the field got a stop and a receipt describing a drive
+                # — and the manifest's own schema used to hand a drafting model
+                # exactly that omission as its default. The manifest now marks
+                # duration_s required with no default; this line is what makes
+                # a caller that ignores the manifest fail safe rather than
+                # silently still.
                 telemetry = self.drive_set(
                     throttle=tool_args.get("throttle", 0.0),
                     steering=tool_args.get("steering", 0.0),
-                    duration_s=tool_args.get("duration_s", 0.0),
+                    duration_s=tool_args.get("duration_s"),
                 )
             elif tool_name == "drive.stop":
                 telemetry = self.drive_stop()

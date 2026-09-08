@@ -139,6 +139,32 @@ def test_zero_duration_is_a_stop_not_a_no_op(car):
     assert hw.last == (0.0, 0.0)
 
 
+def test_THETRAP_an_absent_duration_moves_and_does_not_stop(car):
+    """An OMITTED duration_s is "no opinion", not a request to stop.
+
+    The manifest used to publish `duration_s: {kind: float, default: 0}` while
+    its own prose promised 400 ms, and execute() defaulted the absent field to
+    the same 0.0. A model that filled in the schema default, or any client that
+    left the field out, wrote a STOP and got back a receipt describing a drive.
+    Both halves are fixed: the contract makes the field required with no
+    default, and an absent field here takes the deadman's short lease.
+    """
+    actuator, hw = car
+    outcome = invoke(actuator, "drive.set", {"throttle": 0.3, "steering": 0.0})
+    assert outcome.success
+    assert hw.last[0] > 0, "an omitted duration must not stop the car"
+    assert outcome.telemetry["lease_s"] > 0
+    assert "note" not in outcome.telemetry, "this is a drive, not a stop"
+
+
+def test_an_absent_duration_takes_the_deadmans_short_default(car):
+    """And the lease it takes is the deadman's, not something invented here."""
+    actuator, hw = car
+    outcome = invoke(actuator, "drive.set", {"throttle": 0.2, "steering": 0.0})
+    # The fixture builds the deadman with lease_timeout_s=0.3.
+    assert outcome.telemetry["lease_s"] == pytest.approx(0.3)
+
+
 # --------------------------------------------------------------------------- #
 # The receipt must be true about when the wheels stop
 #
