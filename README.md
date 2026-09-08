@@ -13,6 +13,14 @@ the call slept for the duration it would hold the request path for the whole
 motion, and the next request — the one saying "stop" — would queue behind the
 motion it was meant to cancel.
 
+Three states, and conflating the first two is the bug this contract is written
+against: an **explicit 0** is a zero-length lease, which is a STOP; an **absent**
+`duration_s` is "no opinion" and takes the deadman's short default (400 ms); a
+**stated** number is granted as asked, up to the 2.0 s ceiling. A published
+manifest must therefore never give `duration_s` a schema default — the default a
+model copies would be the one number that stops the car while the receipt says
+it drove. Mark it required and make callers say what they want.
+
 ## The lease a receipt reports is the lease the deadman enforces
 
 `drive.set` returns `lease_s` and `stops_at_monotonic`, the gateway signs them,
