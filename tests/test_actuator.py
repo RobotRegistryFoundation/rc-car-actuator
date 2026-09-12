@@ -525,3 +525,71 @@ def test_a_wedged_command_cannot_prevent_the_stop():
     finally:
         release.set()
         actuator.shutdown()
+
+
+# --------------------------------------------------------------------------- #
+# The stop, through the wire names
+#
+# `estop()` and `clear_estop()` were written and tested here (above) and named
+# in no capability list, no tier table and no dispatch branch, so nothing could
+# reach them through /v1/invoke. `drive.stop` was reachable, but a stop the very
+# next command undoes is not an e-stop. These tests are about REACHABILITY.
+# --------------------------------------------------------------------------- #
+
+
+def test_drive_estop_is_reachable_through_execute_at_read_tier(car):
+    """Anyone who can reach this driver at all may latch it stopped."""
+    actuator, hw = car
+    outcome = invoke(actuator, "drive.estop", tier="read")
+    assert outcome.success is True
+    assert outcome.outcome_kind == "executed"
+    assert outcome.telemetry["estopped"] is True
+    assert "does not survive" in outcome.telemetry["safety_note"]
+    assert actuator.read_state()["estopped"] is True
+
+
+def test_drive_estop_clear_is_refused_below_commission(car):
+    """Read tier can stop this car. It cannot start it again."""
+    actuator, hw = car
+    invoke(actuator, "drive.estop", tier="read")
+
+    refused = invoke(actuator, "drive.estop.clear", tier="read")
+    assert refused.success is False
+    assert refused.outcome_kind == "denied"
+    assert actuator.read_state()["estopped"] is True
+
+    also_refused = invoke(actuator, "drive.estop.clear", tier="actuate")
+    assert also_refused.success is False
+    assert actuator.read_state()["estopped"] is True
+
+    cleared = invoke(actuator, "drive.estop.clear", tier="commission")
+    assert cleared.success is True
+    assert cleared.telemetry["estopped"] is False
+    assert actuator.read_state()["estopped"] is False
+
+
+def test_drive_set_is_refused_while_the_wire_estop_is_latched(car):
+    """The latch the exposure exists for: a stop that the next drive command
+    cannot undo."""
+    actuator, hw = car
+    invoke(actuator, "drive.estop", tier="read")
+
+    outcome = invoke(actuator, "drive.set", {"throttle": 0.5, "duration_s": 1.0})
+    assert outcome.success is False
+    assert "e-stop" in (outcome.error_message or "")
+    assert hw.last == (0.0, 0.0)
+
+
+def test_the_car_declares_a_read_tier_stop():
+    """A driver that declares motion must declare a stop reachable at read tier
+    - the invariant the gateway logs as `allowlist_has_no_stop` at startup."""
+    from rc_car_actuator.actuator import (
+        MOTION_CAPABILITIES,
+        REQUIRED_TIERS,
+        STOP_CAPABILITIES,
+    )
+
+    assert MOTION_CAPABILITIES
+    read_tier_stops = [t for t in STOP_CAPABILITIES
+                       if "read" in (REQUIRED_TIERS.get(t) or frozenset())]
+    assert read_tier_stops, "the car declares motion and no stop at read tier"

@@ -69,13 +69,45 @@ _DRIVE_LOCK = threading.Lock()
 # to sign receipts it did not honour. One ceiling, in one place, inside the
 # thread that applies it.
 __all__ = ["MAX_LEASE_S", "RCCarActuator", "IMPLEMENTED_CAPABILITIES",
-           "REQUIRED_TIERS"]
+           "REQUIRED_TIERS", "MOTION_CAPABILITIES", "STOP_CAPABILITIES"]
 
 #: ROBOT.md capability names this driver actually implements.
 IMPLEMENTED_CAPABILITIES: frozenset[str] = frozenset({
     "drive.set", "drive.stop", "status.report",
     "drive.envelope.open", "drive.envelope.revoke",
+    # `estop`/`clear_estop` were written and tested here and named in no
+    # capability list, no tier table and no dispatch branch, so nothing could
+    # reach them through /v1/invoke. `drive.stop` was reachable, but a stop the
+    # next command undoes is not an e-stop; this exposes the latch that refuses.
+    "drive.estop", "drive.estop.clear",
 })
+
+#: The honest safety note that travels with the stop. This deadman is a Python
+#: thread on Linux: it covers a locked phone, a crashed app, dropped Wi-Fi and a
+#: hung gateway, and it does NOT cover the kernel stalling, this process being
+#: SIGKILLed, or the Pi browning out. See the module docstring.
+ESTOP_SAFETY_NOTE = (
+    "SAFETY: this is a best-effort SOFTWARE stop - the wheels go neutral and "
+    "further motion is refused by a Python process on Linux, NOT by firmware. "
+    "It does not survive this process being killed or the Pi browning out."
+)
+
+TOOL_DESCRIPTIONS: dict[str, str] = {
+    "drive.estop": (
+        "Stop the car and REFUSE further motion until explicitly cleared. "
+        + ESTOP_SAFETY_NOTE
+    ),
+    "drive.estop.clear": (
+        "Release the latched e-stop. Does NOT resume motion. "
+        + ESTOP_SAFETY_NOTE
+    ),
+}
+
+#: Tools that command physical motion, and tools that stop it. Declared rather
+#: than inferred from the name, so the gateway can check at startup that an
+#: allowlist carrying motion also carries a stop (``allowlist_has_no_stop``).
+MOTION_CAPABILITIES: frozenset[str] = frozenset({"drive.set"})
+STOP_CAPABILITIES: frozenset[str] = frozenset({"drive.stop", "drive.estop"})
 
 #: Minimum caller tiers per tool, enforced here as defence in depth. The
 #: gateway's own gate keys off the envelope's self-declared `scope`, which the
@@ -95,6 +127,13 @@ REQUIRED_TIERS: dict[str, frozenset[str]] = {
     # Revoking is like stopping: never refuse it. Someone who can see the car
     # can withdraw its permission to move.
     "drive.envelope.revoke": frozenset({"read", "actuate", "commission"}),
+    # Same reasoning as `drive.stop`, and more so: the latching stop is the one
+    # a moving vehicle needs most, so it is the one no tier may be refused.
+    "drive.estop": frozenset({"read", "actuate", "commission"}),
+    # Clearing makes the car movable again. That is the opposite act, and it
+    # sits behind the bring-up bearer: read tier can stop this car and cannot
+    # start it.
+    "drive.estop.clear": frozenset({"commission"}),
 }
 
 
@@ -106,7 +145,14 @@ class RCCarActuator:
     config_schema: dict = {}
 
     capabilities = ("drive.set", "drive.stop", "status.report",
-                    "drive.envelope.open", "drive.envelope.revoke")
+                    "drive.envelope.open", "drive.envelope.revoke",
+                    "drive.estop", "drive.estop.clear")
+
+    #: Read off the instance by the gateway's startup invariant. An allowlist
+    #: that carries any of `motion_capabilities` and none of `stop_capabilities`
+    #: is logged as `allowlist_has_no_stop`.
+    motion_capabilities = MOTION_CAPABILITIES
+    stop_capabilities = STOP_CAPABILITIES
 
     def __init__(
         self,
@@ -485,6 +531,12 @@ class RCCarActuator:
                 )
             elif tool_name == "drive.stop":
                 telemetry = self.drive_stop()
+            elif tool_name == "drive.estop":
+                telemetry = self.estop()
+                telemetry["safety_note"] = ESTOP_SAFETY_NOTE
+            elif tool_name == "drive.estop.clear":
+                telemetry = self.clear_estop()
+                telemetry["safety_note"] = ESTOP_SAFETY_NOTE
             elif tool_name == "drive.envelope.open":
                 telemetry = self.envelope_open(
                     motion_budget_s=tool_args.get("motion_budget_s", 0.0),
