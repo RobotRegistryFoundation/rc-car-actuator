@@ -312,3 +312,54 @@ def test_a_renewed_lease_replaces_the_old_one_rather_than_extending_it():
             f"a re-fed 0.2 s lease ran for {measured:.3f} s"
     finally:
         dm.shutdown()
+
+
+def _stop_failure_records(caplog):
+    return [r for r in caplog.records if r.name == "rc_car.deadman" and "stop()" in r.getMessage()]
+
+
+def test_a_stop_that_keeps_failing_is_retried_every_tick_but_logged_once(caplog):
+    # An unplugged PWM board fails every write. The watchdog must keep trying
+    # every tick, but a traceback per tick flooded a RAM-backed journal.
+    caplog.set_level("DEBUG", logger="rc_car.deadman")
+    stop = StopRecorder(raises=True)
+    d = Deadman(stop, timeout_s=0.05)
+    time.sleep(0.5)
+    d.shutdown()
+    assert stop.calls >= 5  # still retried every tick
+    failures = _stop_failure_records(caplog)
+    assert len(failures) == 1
+    assert failures[0].exc_info is not None  # the first one keeps its traceback
+
+
+def test_a_persistent_failure_is_counted_again_after_the_interval(caplog, monkeypatch):
+    import rc_car_actuator.deadman as dm
+
+    monkeypatch.setattr(dm, "STOP_FAIL_LOG_INTERVAL_S", 0.1)
+    caplog.set_level("DEBUG", logger="rc_car.deadman")
+    stop = StopRecorder(raises=True)
+    d = Deadman(stop, timeout_s=0.05)
+    time.sleep(0.45)
+    d.shutdown()
+    msgs = [r.getMessage() for r in _stop_failure_records(caplog)]
+    assert any("still failing" in m for m in msgs)
+    assert len(msgs) < stop.calls  # throttled, not one per attempt
+
+
+def test_a_changed_error_gets_its_own_traceback_and_recovery_is_announced(caplog):
+    caplog.set_level("DEBUG", logger="rc_car.deadman")
+    errors = iter([OSError(121, "Remote I/O error"), OSError(121, "Remote I/O error"),
+                   RuntimeError("bus reset")])
+
+    def stop():
+        e = next(errors, None)
+        if e is not None:
+            raise e
+
+    d = Deadman(stop, timeout_s=0.05)
+    time.sleep(0.4)
+    d.shutdown()
+    msgs = [r.getMessage() for r in _stop_failure_records(caplog)]
+    tracebacks = [r for r in _stop_failure_records(caplog) if r.exc_info]
+    assert len(tracebacks) == 2  # the OSError once, the new RuntimeError once
+    assert any("succeeded after 3 failed attempts" in m for m in msgs)

@@ -110,6 +110,16 @@ MAX_LEASE_S = 2.0
 #: watchdog on Linux does not have.
 TICK_S = 0.05
 
+#: While stop() keeps failing, how often the watchdog says so again.
+#:
+#: The retry itself runs every tick and is not throttled; only the log line is.
+#: A missing or unplugged PWM board fails every write, and a full traceback per
+#: tick was ~30k journal lines a minute on a Pi whose journal lives in RAM,
+#: which pushed every other unit's logs out. The first failure (and any change
+#: in the error) still gets its traceback; after that, one count per interval,
+#: and one line when a stop finally goes through.
+STOP_FAIL_LOG_INTERVAL_S = 60.0
+
 
 class Deadman:
     """Holds the vehicle live only while commands keep arriving."""
@@ -132,6 +142,11 @@ class Deadman:
                 duration it asks for. May only TIGHTEN `MAX_LEASE_S`.
         """
         self._stop = stop
+        self._fail_lock = threading.Lock()
+        self._fail_count = 0
+        self._fail_since = 0.0
+        self._fail_logged_at = 0.0
+        self._fail_sig: tuple[str, str] | None = None
         self._timeout_s = max(0.0, float(timeout_s))
         self._tick_s = tick_s
         # Clamped to MAX_LEASE_S rather than trusted: the ceiling may be
@@ -268,11 +283,52 @@ class Deadman:
     def _safe_stop(self) -> None:
         try:
             self._stop()
-        except Exception:
+        except Exception as exc:
             # A raising stop() must not kill the watchdog thread; if it did,
             # nothing would ever try to stop the vehicle again. Log and retry
-            # on the next tick.
-            logger.exception("deadman stop() raised; will retry next tick")
+            # on the next tick. The retry is every tick; the log is not (see
+            # STOP_FAIL_LOG_INTERVAL_S).
+            self._note_stop_failure(exc)
+        else:
+            self._note_stop_success()
+
+    def _note_stop_failure(self, exc: Exception) -> None:
+        now = time.monotonic()
+        sig = (type(exc).__name__, str(exc))
+        with self._fail_lock:
+            first = self._fail_count == 0
+            changed = sig != self._fail_sig
+            if first:
+                self._fail_since = now
+            self._fail_count += 1
+            count = self._fail_count
+            since = self._fail_since
+            due = now - self._fail_logged_at >= STOP_FAIL_LOG_INTERVAL_S
+            if first or changed or due:
+                self._fail_logged_at = now
+            self._fail_sig = sig
+        if first or changed:
+            logger.exception("deadman stop() raised; will retry every tick")
+        elif due:
+            logger.error(
+                "deadman stop() still failing: %d attempts in %.0fs, last %s: %s; "
+                "retrying every tick",
+                count, now - since, sig[0], sig[1],
+            )
+
+    def _note_stop_success(self) -> None:
+        with self._fail_lock:
+            count = self._fail_count
+            if count == 0:
+                return
+            since = self._fail_since
+            self._fail_count = 0
+            self._fail_sig = None
+            self._fail_logged_at = 0.0
+        logger.warning(
+            "deadman stop() succeeded after %d failed attempts over %.1fs",
+            count, time.monotonic() - since,
+        )
 
     def _run(self) -> None:
         while self._running:
