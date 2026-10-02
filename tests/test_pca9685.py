@@ -474,3 +474,61 @@ class TestReachability:
         telemetry = RCCarActuator(hardware=SimulatedDrive()).read_state()
         # None means "no answer available". True would be a claim nothing checked.
         assert telemetry["hardware_reachable"] is None
+
+
+# -- a chip that power-cycled under a running driver (OpenCastor#947) --------
+
+#: What a PCA9685 holds after a power-on reset, per the datasheet: PRESCALE
+#: back to 0x1E (~200 Hz) and MODE1 asleep with ALLCALL set.
+_RESET_PRESCALE = 0x1E
+_RESET_MODE1 = 0x11
+
+
+def _power_cycle(bus):
+    """The pack is unplugged and plugged back in; the gateway never noticed."""
+    bus.registers[_PRESCALE] = _RESET_PRESCALE
+    bus.registers[_MODE1] = _RESET_MODE1
+
+
+def test_A_POWER_CYCLED_CHIP_IS_RECONFIGURED_BEFORE_THE_NEXT_COMMAND(bus, drive):
+    """Found live: after a disarm/re-arm the chip ran at 200 Hz while the
+    driver still believed 50 Hz, so every command was accepted, written, and
+    emitted at a quarter of its width. The first command after the cycle must
+    reconfigure the chip BEFORE writing a pulse, so no wrong-scale pulse lands."""
+    drive.set_drive(0.2, 0.0)
+    _power_cycle(bus)
+    writes_before = len(bus.writes)
+
+    drive.set_drive(0.2, 0.0)
+
+    assert bus.registers[_PRESCALE] == PCA9685Drive.prescale(DEFAULT_FRAME_HZ)
+    new = bus.writes[writes_before:]
+    prescale_at = next(i for i, w in enumerate(new) if w[1] == _PRESCALE)
+    first_channel_write = next(
+        i for i, w in enumerate(new) if _LED0_ON_L <= w[1] < _LED0_ON_L + 8
+    )
+    assert prescale_at < first_channel_write
+
+
+def test_a_chip_that_kept_its_configuration_is_not_reconfigured(bus, drive):
+    drive.set_drive(0.2, 0.0)
+    writes_before = len(bus.writes)
+    drive.set_drive(0.3, 0.0)
+    assert not any(w[1] == _PRESCALE for w in bus.writes[writes_before:])
+
+
+def test_a_power_cycled_chip_that_cannot_be_reconfigured_refuses_to_drive(bus, drive):
+    _power_cycle(bus)
+    bus.fail_on_register = _PRESCALE
+    with pytest.raises(OSError, match="lost its configuration"):
+        drive.set_drive(0.2, 0.0)
+
+
+def test_reachable_reports_and_repairs_a_power_cycled_chip(bus, drive):
+    """`reachable()` is what telemetry polls. Answering at the reset frame rate
+    is not healthy, so it must reconfigure rather than report None on a chip
+    that would emit garbage."""
+    _power_cycle(bus)
+    assert drive.reachable() is None
+    assert bus.registers[_PRESCALE] == PCA9685Drive.prescale(DEFAULT_FRAME_HZ)
+    assert not bus.registers[_MODE1] & 0x10
