@@ -179,13 +179,20 @@ class PCA9685Drive:
         # bus error — so the only thing the old behaviour prevented was FINDING
         # OUT. Actuation still fails closed; only observability changed.
         self._ready = False
+        #: Until when the ESC is still arming after the chip last came up
+        #: (monotonic seconds). See `set_drive`.
+        self._arming_until = 0.0
         self._bring_up()
 
-    def _bring_up(self) -> bool:
+    def _bring_up(self, *, hold_arming: bool = True) -> bool:
         """Configure, centre and arm. True if the chip answered.
 
         Retried on demand rather than once at startup, so plugging the pack back
         in recovers the drive without restarting the service.
+
+        `hold_arming=False` is for the command path: it records how long the ESC
+        still needs neutral and leaves the waiting to `set_drive`, which waits on
+        the stop event rather than sleeping through it.
         """
         try:
             self._configure()
@@ -202,8 +209,10 @@ class PCA9685Drive:
         # Hold that neutral long enough for an ESC to arm. Only when the chip
         # has just come up, so it never delays a command or a stop.
         if not self._ready and self._ch.arm_delay_s > 0:
-            time.sleep(self._ch.arm_delay_s)
-            logger.info("ESC arming: held neutral for %.2fs", self._ch.arm_delay_s)
+            self._arming_until = time.monotonic() + self._ch.arm_delay_s
+            if hold_arming:
+                time.sleep(self._ch.arm_delay_s)
+                logger.info("ESC arming: held neutral for %.2fs", self._ch.arm_delay_s)
         self._ready = True
         return True
 
@@ -273,13 +282,48 @@ class PCA9685Drive:
         # construction survive an absent chip opened exactly this hole — the
         # chip can now come back mid-session, answering writes while still
         # unconfigured — and this package's own test caught it.
-        if not self._ready and not self._bring_up():
+        if not self._ready and not self._bring_up(hold_arming=False):
             raise OSError(
                 f"PCA9685 at 0x{self._address:02x} is not configured and did "
                 f"not answer; refusing to command an unconfigured chip")
+        # NOR ONE THAT FORGOT ITS CONFIGURATION (OpenCastor#947).
+        #
+        # `_ready` is this process's memory, not the chip's. On this car the
+        # chip is powered off the ESC's BEC, so disarming the pack power-cycles
+        # it while the gateway keeps running, and it comes back at its reset
+        # frame rate (~200 Hz) answering every write. Found live 2026-08-17: a
+        # day after a disarm, every drive.set was accepted and written, and a
+        # commanded 1575 us came out as ~394 us that the ESC ignored. Wheels
+        # still, receipts green. One register read per command closes that
+        # window entirely; a re-arm then reconfigures before the first write.
+        lost = self._lost_configuration()
+        if lost is not None:
+            logger.warning("PCA9685 at 0x%02x lost its configuration (%s), most "
+                           "likely a power cycle; reconfiguring before driving",
+                           self._address, lost)
+            self._ready = False
+            if not self._bring_up(hold_arming=False):
+                raise OSError(
+                    f"PCA9685 at 0x{self._address:02x} lost its configuration "
+                    f"({lost}) and could not be reconfigured; refusing to drive")
         # A new drive command means driving is intended again, so any stop that
         # aborted a previous arming sequence stops suppressing this one.
         self._stop_requested.clear()
+        # AN ESC THAT HAS JUST COME BACK IS STILL ARMING, AND A STOP CUTS THAT SHORT.
+        #
+        # Bringing the chip back up re-arms the ESC, which needs neutral held for
+        # `arm_delay_s` before it takes a command. That hold used to be a plain
+        # sleep inside `_bring_up`: a stop arriving during it wrote neutral, the
+        # clear just above forgot it, and this command then drove for its whole
+        # lease after an acknowledged stop. Every pack re-arm opened that window.
+        # It is a wait on the stop event now, like each pause of the reverse
+        # handshake, and a stop during it drops this command.
+        remaining = self._arming_until - time.monotonic()
+        if remaining > 0:
+            if self._stop_requested.wait(timeout=remaining):
+                self._last_throttle = 0.0
+                return
+            logger.info("ESC arming: held neutral for %.2fs", self._ch.arm_delay_s)
         if self._needs_reverse_arming(throttle):
             if self._arm_reverse(throttle):
                 # A STOP ARRIVED DURING THE HANDSHAKE, SO DO NOT DRIVE.
@@ -388,6 +432,22 @@ class PCA9685Drive:
     def _read(self, register: int) -> int:
         return self._bus.read_byte_data(self._address, register)
 
+    def _lost_configuration(self) -> str | None:
+        """Why the chip no longer holds what `_configure` wrote, or None.
+
+        Reads the chip, not `_ready`. A power-on reset puts PRESCALE back to its
+        default and sets SLEEP, so either one differing means every pulse width
+        written from here on would land at the wrong scale, or not at all.
+        Raises OSError if the chip does not answer.
+        """
+        expected = self.prescale(self._ch.frame_hz, self._ch.oscillator_hz)
+        actual = self._read(_PRESCALE)
+        if actual != expected:
+            return f"PRESCALE is {actual}, configured {expected}"
+        if self._read(_MODE1) & _MODE1_SLEEP:
+            return "MODE1 SLEEP is set"
+        return None
+
     def reachable(self) -> str | None:
         """None if the chip answers, else why it does not.
 
@@ -415,6 +475,17 @@ class PCA9685Drive:
         # out of a reset is a permanent full-travel command to a servo.
         if not self._ready and not self._bring_up():
             return "present but could not be configured"
+        # Answering is not the same as configured: after a power cycle the chip
+        # answers at its reset frame rate while `_ready` still says configured.
+        try:
+            lost = self._lost_configuration()
+        except Exception as exc:  # noqa: BLE001 - any bus error means absent
+            self._ready = False
+            return f"{type(exc).__name__}: {exc}"
+        if lost is not None:
+            self._ready = False
+            if not self._bring_up():
+                return f"lost its configuration ({lost}) and could not be reconfigured"
         return None
 
 
