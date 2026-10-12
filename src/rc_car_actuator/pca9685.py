@@ -179,13 +179,20 @@ class PCA9685Drive:
         # bus error — so the only thing the old behaviour prevented was FINDING
         # OUT. Actuation still fails closed; only observability changed.
         self._ready = False
+        #: Until when the ESC is still arming after the chip last came up
+        #: (monotonic seconds). See `set_drive`.
+        self._arming_until = 0.0
         self._bring_up()
 
-    def _bring_up(self) -> bool:
+    def _bring_up(self, *, hold_arming: bool = True) -> bool:
         """Configure, centre and arm. True if the chip answered.
 
         Retried on demand rather than once at startup, so plugging the pack back
         in recovers the drive without restarting the service.
+
+        `hold_arming=False` is for the command path: it records how long the ESC
+        still needs neutral and leaves the waiting to `set_drive`, which waits on
+        the stop event rather than sleeping through it.
         """
         try:
             self._configure()
@@ -202,8 +209,10 @@ class PCA9685Drive:
         # Hold that neutral long enough for an ESC to arm. Only when the chip
         # has just come up, so it never delays a command or a stop.
         if not self._ready and self._ch.arm_delay_s > 0:
-            time.sleep(self._ch.arm_delay_s)
-            logger.info("ESC arming: held neutral for %.2fs", self._ch.arm_delay_s)
+            self._arming_until = time.monotonic() + self._ch.arm_delay_s
+            if hold_arming:
+                time.sleep(self._ch.arm_delay_s)
+                logger.info("ESC arming: held neutral for %.2fs", self._ch.arm_delay_s)
         self._ready = True
         return True
 
@@ -273,7 +282,7 @@ class PCA9685Drive:
         # construction survive an absent chip opened exactly this hole — the
         # chip can now come back mid-session, answering writes while still
         # unconfigured — and this package's own test caught it.
-        if not self._ready and not self._bring_up():
+        if not self._ready and not self._bring_up(hold_arming=False):
             raise OSError(
                 f"PCA9685 at 0x{self._address:02x} is not configured and did "
                 f"not answer; refusing to command an unconfigured chip")
@@ -293,13 +302,28 @@ class PCA9685Drive:
                            "likely a power cycle; reconfiguring before driving",
                            self._address, lost)
             self._ready = False
-            if not self._bring_up():
+            if not self._bring_up(hold_arming=False):
                 raise OSError(
                     f"PCA9685 at 0x{self._address:02x} lost its configuration "
                     f"({lost}) and could not be reconfigured; refusing to drive")
         # A new drive command means driving is intended again, so any stop that
         # aborted a previous arming sequence stops suppressing this one.
         self._stop_requested.clear()
+        # AN ESC THAT HAS JUST COME BACK IS STILL ARMING, AND A STOP CUTS THAT SHORT.
+        #
+        # Bringing the chip back up re-arms the ESC, which needs neutral held for
+        # `arm_delay_s` before it takes a command. That hold used to be a plain
+        # sleep inside `_bring_up`: a stop arriving during it wrote neutral, the
+        # clear just above forgot it, and this command then drove for its whole
+        # lease after an acknowledged stop. Every pack re-arm opened that window.
+        # It is a wait on the stop event now, like each pause of the reverse
+        # handshake, and a stop during it drops this command.
+        remaining = self._arming_until - time.monotonic()
+        if remaining > 0:
+            if self._stop_requested.wait(timeout=remaining):
+                self._last_throttle = 0.0
+                return
+            logger.info("ESC arming: held neutral for %.2fs", self._ch.arm_delay_s)
         if self._needs_reverse_arming(throttle):
             if self._arm_reverse(throttle):
                 # A STOP ARRIVED DURING THE HANDSHAKE, SO DO NOT DRIVE.

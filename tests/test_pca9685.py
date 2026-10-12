@@ -524,6 +524,76 @@ def test_a_power_cycled_chip_that_cannot_be_reconfigured_refuses_to_drive(bus, d
         drive.set_drive(0.2, 0.0)
 
 
+#: The shipped arming hold is 0.5 s; 0.4 keeps these tests quick and still far
+#: longer than the timing margins they assert.
+ARMING = DriveChannels(throttle=Channel(0), steering=Channel(1), arm_delay_s=0.4)
+
+
+def test_a_re_armed_ESC_gets_its_neutral_hold_before_the_next_command(bus):
+    """A power cycle re-arms the ESC, so the first command after it waits out
+    `arm_delay_s` of neutral before any throttle reaches the chip."""
+    import time as _t
+
+    drive = PCA9685Drive(bus, channels=ARMING)
+    drive.set_drive(0.2, 0.0)
+    _power_cycle(bus)
+    bus.writes.clear()
+
+    started = _t.monotonic()
+    drive.set_drive(0.3, 0.0)
+
+    assert _t.monotonic() - started >= 0.35, "the re-armed ESC never got its neutral hold"
+    throttles = [t for c, t in _throttle_sequence(bus) if c == 0]
+    assert throttles[0] == pytest.approx(1500, abs=3), "neutral first"
+    assert throttles[-1] == pytest.approx(1650, abs=3), "then the command"
+
+
+def test_A_STOP_DURING_RE_ARMING_DROPS_THE_COMMAND(bus):
+    """Found in review: the re-arm hold was a plain sleep. A stop landing in it
+    was acknowledged, then this command cleared it and drove for its whole lease.
+    The hold is a wait on the stop event now, and a stop ends the command."""
+    import threading
+    import time as _t
+
+    drive = PCA9685Drive(bus, channels=ARMING)
+    drive.set_drive(0.2, 0.0)
+    _power_cycle(bus)
+
+    done = threading.Event()
+
+    def command():
+        drive.set_drive(0.3, 0.0)
+        done.set()
+
+    threading.Thread(target=command, daemon=True).start()
+    _t.sleep(0.1)                        # reconfigured, holding neutral for the ESC
+    stopped_at = _t.monotonic()
+    drive.neutral()                      # the deadman's move
+    assert done.wait(timeout=2.0), "the command never finished"
+    assert _t.monotonic() - stopped_at < 0.2, "the command sat out the hold after a stop"
+    assert bus.pulse_us(0) == pytest.approx(1500, abs=3), "and the car did not drive"
+
+
+def test_a_stop_that_cut_the_hold_short_does_not_shorten_the_next_one(bus):
+    """The ESC still needs its neutral; the next command waits for what is left."""
+    import threading
+    import time as _t
+
+    drive = PCA9685Drive(bus, channels=ARMING)
+    drive.set_drive(0.2, 0.0)
+    _power_cycle(bus)
+    first = threading.Thread(target=drive.set_drive, args=(0.3, 0.0), daemon=True)
+    first.start()
+    _t.sleep(0.1)
+    drive.neutral()
+    first.join(timeout=2.0)
+
+    started = _t.monotonic()
+    drive.set_drive(0.3, 0.0)
+    assert _t.monotonic() - started >= 0.2, "the rest of the hold was skipped"
+    assert bus.pulse_us(0) == pytest.approx(1650, abs=3)
+
+
 def test_reachable_reports_and_repairs_a_power_cycled_chip(bus, drive):
     """`reachable()` is what telemetry polls. Answering at the reset frame rate
     is not healthy, so it must reconfigure rather than report None on a chip
